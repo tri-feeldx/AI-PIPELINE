@@ -19,6 +19,7 @@ from pipeline.page_classifier import classify_all_pages
 from pipeline.grid_extractor import extract_grids_from_pdf, extract_grid, PT_TO_MM
 from pipeline.element_detector import detect_elements
 from pipeline.level_extractor import extract_levels_from_pdf
+from pipeline.foundation_extractor import extract_foundations
 
 
 # ── Section dimension lookup (built-in common Australian sections) ─────────────
@@ -100,6 +101,9 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     all_beams:   list[dict] = []
     all_slabs:   list[dict] = []
 
+    # Foundation extraction results (from foundation_plan page, if present)
+    foundation_extraction: dict = {}
+
     for idx, cls in enumerate(classifications):
         page_num  = cls["page_num"]
         page_type = cls["drawing_type"]
@@ -113,6 +117,19 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
                 page_grid = grid  # fall back to global grid
 
             elements = detect_elements(page, page_type, page_grid)
+
+            # Run dedicated foundation extractor on foundation plan pages.
+            # Keep the result with the MOST footings (Footing Plan at 1:100
+            # beats Footing Details at 1:20 which appears first in page order).
+            if page_type == "foundation_plan":
+                fdn_result = extract_foundations(
+                    page, page_grid if page_grid["x_axes"] else grid
+                )
+                if fdn_result.get("has_foundation_plan"):
+                    if len(fdn_result.get("footings", [])) > len(
+                        foundation_extraction.get("footings", [])
+                    ):
+                        foundation_extraction = fdn_result
         else:
             elements = {"columns": [], "beams": [], "slabs": []}
 
@@ -155,8 +172,18 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     if progress_cb:
         progress_cb("levels", 1.0)
 
-    # ── Stage 4b: Generate pile positions from grid ───────────────────────────
-    foundations = _generate_piles_from_grid(grid)
+    # ── Stage 4b: Foundation elements ────────────────────────────────────────
+    # Priority: use data extracted directly from a foundation_plan page.
+    # Fall back to auto-generating at every grid intersection only when
+    # no foundation_plan page was found in the PDF.
+    if foundation_extraction.get("footings"):
+        foundations   = foundation_extraction["footings"]
+        ground_beams  = foundation_extraction.get("ground_beams", [])
+        rafts         = foundation_extraction.get("rafts", [])
+    else:
+        foundations  = _generate_piles_from_grid(grid)
+        ground_beams = []
+        rafts        = []
 
     # ── Stage 4c: Assign section sizes and level spans ───────────────────────
     bottom_lv = levels[0]  if levels else {"name": "GROUND FLOOR", "elevation_mm": 0}
@@ -239,16 +266,22 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             "unit": "mm",
         },
         "levels": levels,
-        "columns":     cols_final,
-        "beams":       beams_final,
-        "slabs":       slabs_final,
-        "foundations": foundations,
+        "columns":      cols_final,
+        "beams":        beams_final,
+        "slabs":        slabs_final,
+        "foundations":          foundations,
+        "ground_beams":         ground_beams,
+        "rafts":                rafts,
+        "foundation_schedule":  foundation_extraction.get("schedule", {}),
+        "foundation_pile_spec": foundation_extraction.get("pile_spec", {}),
         "summary_counts": {
-            "columns":     len(cols_final),
-            "beams":       len(beams_final),
-            "slabs":       len(slabs_final),
-            "foundations": len(foundations),
-            "levels":      len(levels),
+            "columns":      len(cols_final),
+            "beams":        len(beams_final),
+            "slabs":        len(slabs_final),
+            "foundations":  len(foundations),
+            "ground_beams": len(ground_beams),
+            "rafts":        len(rafts),
+            "levels":       len(levels),
         },
     }
 

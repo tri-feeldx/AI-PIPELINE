@@ -29,6 +29,43 @@ def _level_z(level_name: str, levels: list[dict]) -> float:
     return 0.0
 
 
+def _pile_offsets(pile_count: int, dia_mm: float) -> list[tuple[float, float]]:
+    """Return (dx_mm, dy_mm) offsets from cap centre for each pile in a group.
+
+    Uses standard 2.5D centre-to-centre spacing (LOD 300 simplified arrangement).
+    """
+    s = dia_mm * 2.5   # spacing
+    h = s * 0.5        # half-spacing
+    r3 = s * 0.577     # s/√3  (triangle geometry)
+
+    if pile_count <= 0:
+        return [(0, 0)]   # single centred pile as default
+
+    layouts: dict[int, list[tuple[float, float]]] = {
+        1: [(0, 0)],
+        2: [(-h, 0), (h, 0)],
+        3: [(0, r3), (-h, -r3 * 0.5), (h, -r3 * 0.5)],
+        4: [(-h, -h), (h, -h), (h, h), (-h, h)],
+        5: [(0, 0), (-h, -h), (h, -h), (h, h), (-h, h)],
+        6: [(-s, -h), (0, -h), (s, -h), (-s, h), (0, h), (s, h)],
+    }
+    if pile_count in layouts:
+        return layouts[pile_count]
+
+    # Generic grid layout for larger counts
+    cols = max(1, math.ceil(math.sqrt(pile_count)))
+    rows = math.ceil(pile_count / cols)
+    positions = []
+    for r in range(rows):
+        for c in range(cols):
+            if len(positions) >= pile_count:
+                break
+            dx = (c - (cols - 1) / 2) * s
+            dy = (r - (rows - 1) / 2) * s
+            positions.append((dx, dy))
+    return positions
+
+
 def generate_ruby(model: dict, job_dir: str) -> dict:
     """Generate .rb and report. Returns report dict."""
     job_dir = Path(job_dir)
@@ -41,18 +78,22 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
     skipped  = []
     warnings = []
     lines    = []
-    counts   = {"columns": 0, "beams": 0, "slabs": 0, "foundations": 0}
+    counts   = {"columns": 0, "beams": 0, "slabs": 0, "foundations": 0, "ground_beams": 0}
 
     bottom_lv = levels[0]  if levels else {"name": "GROUND FLOOR", "elevation_mm": 0}
     top_lv    = levels[-1] if levels else {"name": "ROOF",         "elevation_mm": 18000}
+
+    ground_beams = model.get("ground_beams", [])
+    rafts        = model.get("rafts", [])
 
     # ── Header ────────────────────────────────────────────────────────────────
     lines += [
         "# =============================================================",
         "# auto_pipeline — PDF Structural → SketchUp 3D (vector build)",
         f"# Generated: {time.strftime('%Y-%m-%dT%H:%M:%S')}",
-        f"# Columns: {len(columns)}  Beams: {len(beams)}  "
-        f"Slabs: {len(slabs)}  Foundations: {len(foundations)}",
+        f"# Columns: {len(columns)}  Beams: {len(beams)}  Slabs: {len(slabs)}  "
+        f"Foundations: {len(foundations)}  GroundBeams: {len(ground_beams)}  "
+        f"Rafts: {len(rafts)}",
         "# Run via SketchUp: Extensions > Ruby Console → load 'path/to/file.rb'",
         "# =============================================================",
         "",
@@ -64,16 +105,20 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
 
     # ── Layers ────────────────────────────────────────────────────────────────
     lines += [
-        "lyr_found = model.layers.add('Foundations')",
-        "lyr_col   = model.layers.add('Columns')",
-        "lyr_beam  = model.layers.add('Beams')",
-        "lyr_slab  = model.layers.add('Slabs')",
+        "lyr_found  = model.layers.add('Foundations')",
+        "lyr_pile   = model.layers.add('Piles')",
+        "lyr_gbeam  = model.layers.add('GroundBeams')",
+        "lyr_raft   = model.layers.add('Rafts')",
+        "lyr_col    = model.layers.add('Columns')",
+        "lyr_beam   = model.layers.add('Beams')",
+        "lyr_slab   = model.layers.add('Slabs')",
         "",
     ]
 
     # ── Materials ─────────────────────────────────────────────────────────────
     lines += [
         "mat_conc  = model.materials.add('Concrete');  mat_conc.color  = Sketchup::Color.new(190,185,175)",
+        "mat_pile  = model.materials.add('Pile');      mat_pile.color  = Sketchup::Color.new(160,155,145)",
         "mat_steel = model.materials.add('Steel');     mat_steel.color = Sketchup::Color.new(90,130,175)",
         "mat_slab  = model.materials.add('Slab');      mat_slab.color  = Sketchup::Color.new(215,205,190)",
         "",
@@ -81,7 +126,7 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
 
     # ── Helper functions ──────────────────────────────────────────────────────
     lines += [
-        "# Axis-aligned box",
+        "# Axis-aligned box: origin corner (x,y,z), dimensions (w,d,h)",
         "def ap_box(ents, x, y, z, w, d, h, lyr, mat)",
         "  g = ents.add_group; g.layer = lyr",
         "  f = g.entities.add_face(",
@@ -91,7 +136,7 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         "  g",
         "end",
         "",
-        "# Beam between two 3D points (any angle, uses Transform)",
+        "# Beam between two XY points at elevation z (any plan angle)",
         "def ap_beam(ents, x1,y1,z1, x2,y2,z2, bw,bh, lyr, mat)",
         "  dx=x2-x1; dy=y2-y1",
         "  len=Math.sqrt(dx*dx+dy*dy); return if len<1e-6",
@@ -108,12 +153,13 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         "  g.transform!(tr); g",
         "end",
         "",
-        "# Circular cylinder (piles / round columns)",
+        "# Circular cylinder: centre (cx,cy), bottom at z_bot, extruding upward by height",
         "def ap_cylinder(ents, cx,cy,z_bot, radius, height, lyr, mat)",
         "  g=ents.add_group; g.layer=lyr",
         "  ge=g.entities",
-        "  n=16  # segments",
-        "  pts=(0...n).map{|i| a=2*Math::PI*i/n; Geom::Point3d.new(cx+radius*Math.cos(a),cy+radius*Math.sin(a),z_bot)}",
+        "  n=16",
+        "  pts=(0...n).map{|i| a=2*Math::PI*i/n",
+        "    Geom::Point3d.new(cx+radius*Math.cos(a),cy+radius*Math.sin(a),z_bot)}",
         "  f=ge.add_face(pts)",
         "  f.pushpull(height)",
         "  g.entities.each{|e| e.material=mat if e.is_a?(Sketchup::Face)}",
@@ -122,21 +168,143 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         "",
     ]
 
-    # ── Foundations (piles) ───────────────────────────────────────────────────
-    lines += ["# ===== FOUNDATIONS (PILES) ====="]
-    z_pile_top = _in(bottom_lv.get("elevation_mm", 0))
-    z_pile_bot = z_pile_top - _in(500)  # pile goes 500mm below ground
+    # ── Foundations ───────────────────────────────────────────────────────────
+    lines += ["# ===== FOUNDATIONS ====="]
+
+    # Ground floor elevation (top of pile cap / top of pad footing)
+    z_ground = _in(bottom_lv.get("elevation_mm", 0))
+    # Pile caps sit slightly below ground slab (300 mm setdown)
+    CAP_SETDOWN_MM = 300
 
     for f in foundations:
-        x = _in(f.get("x_mm", 0))
-        y = _in(f.get("y_mm", 0))
-        r = _in(f.get("width_mm", 750) / 2)
+        ftype      = f.get("ftype", "pile")   # pile_cap | pad_footing | strip_footing | pile
+        x_c        = _in(f.get("x_mm", 0))
+        y_c        = _in(f.get("y_mm", 0))
+        cap_w      = _in(f.get("width_mm",  1500))
+        cap_d      = _in(f.get("depth_mm",  1500))
+        cap_h      = _in(f.get("height_mm", 700))
+        pile_dia   = f.get("pile_dia_mm", 0)
+        pile_len   = f.get("pile_len_mm", 0)
+        pile_count = f.get("pile_count",  1)
+        gref       = f.get("grid_ref", "")
+        fid        = f.get("id", "")
+
+        # Z: top of cap/footing = ground level - setdown
+        z_cap_top = z_ground - _in(CAP_SETDOWN_MM)
+        z_cap_bot = z_cap_top - cap_h
+
+        if ftype in ("pile_cap", "pile"):
+            # Pile cap box
+            lines.append(
+                f"ap_box(ents, {x_c-cap_w/2:.6f},{y_c-cap_d/2:.6f},{z_cap_bot:.6f},"
+                f"{cap_w:.6f},{cap_d:.6f},{cap_h:.6f},lyr_found,mat_conc)"
+                f"  # {fid} cap @ {gref}"
+            )
+            counts["foundations"] += 1
+
+            # Piles below cap
+            if pile_dia > 0 and pile_len > 0:
+                pile_r   = _in(pile_dia / 2)
+                pile_h_i = _in(pile_len)
+                z_pile_top = z_cap_bot
+                z_pile_bot_coord = z_pile_top - pile_h_i
+
+                offsets = _pile_offsets(pile_count, pile_dia)
+                for (odx_mm, ody_mm) in offsets:
+                    px = x_c + _in(odx_mm)
+                    py = y_c + _in(ody_mm)
+                    lines.append(
+                        f"ap_cylinder(ents, {px:.6f},{py:.6f},{z_pile_bot_coord:.6f},"
+                        f"{pile_r:.6f},{pile_h_i:.6f},lyr_pile,mat_pile)"
+                        f"  # pile Ø{pile_dia:.0f} @ {gref}"
+                    )
+
+        elif ftype == "pad_footing":
+            # Simple rectangular pad footing
+            lines.append(
+                f"ap_box(ents, {x_c-cap_w/2:.6f},{y_c-cap_d/2:.6f},{z_cap_bot:.6f},"
+                f"{cap_w:.6f},{cap_d:.6f},{cap_h:.6f},lyr_found,mat_conc)"
+                f"  # {fid} @ {gref}"
+            )
+            counts["foundations"] += 1
+
+        elif ftype == "strip_footing":
+            # Strip footing is handled as a ground beam spanning two columns;
+            # emit as a rectangular beam at foundation level.
+            # (from/to coords may be set if extracted — otherwise use cap width as a square pad)
+            to_x = _in(f.get("to_x_mm", f.get("x_mm", 0)))
+            to_y = _in(f.get("to_y_mm", f.get("y_mm", 0)))
+            if abs(to_x - x_c) > 1e-4 or abs(to_y - y_c) > 1e-4:
+                lines.append(
+                    f"ap_beam(ents, {x_c:.6f},{y_c:.6f},{z_cap_top:.6f},"
+                    f"{to_x:.6f},{to_y:.6f},{z_cap_top:.6f},"
+                    f"{cap_w:.6f},{cap_h:.6f},lyr_found,mat_conc)"
+                    f"  # {fid} strip @ {gref}"
+                )
+            else:
+                lines.append(
+                    f"ap_box(ents, {x_c-cap_w/2:.6f},{y_c-cap_d/2:.6f},{z_cap_bot:.6f},"
+                    f"{cap_w:.6f},{cap_d:.6f},{cap_h:.6f},lyr_found,mat_conc)"
+                    f"  # {fid} strip-pad @ {gref}"
+                )
+            counts["foundations"] += 1
+
+        else:
+            # Legacy / unknown type: cylindrical pile (backwards-compatible)
+            r = _in(f.get("width_mm", 750) / 2)
+            depth_i = _in(f.get("depth_mm", 500))
+            lines.append(
+                f"ap_cylinder(ents, {x_c:.6f},{y_c:.6f},{z_cap_bot:.6f},"
+                f"{r:.6f},{depth_i:.6f},lyr_found,mat_conc)"
+                f"  # {fid} @ {gref}"
+            )
+            counts["foundations"] += 1
+
+    lines.append("")
+
+    # ── Ground beams ───────────────────────────────────────────────────────────
+    lines += ["# ===== GROUND BEAMS ====="]
+    z_gbeam = z_ground - _in(CAP_SETDOWN_MM)   # top of ground beams = top of pile caps
+
+    for gb in ground_beams:
+        x1 = _in(gb.get("from_x_mm", 0))
+        y1 = _in(gb.get("from_y_mm", 0))
+        x2 = _in(gb.get("to_x_mm",   0))
+        y2 = _in(gb.get("to_y_mm",   0))
+        bw = _in(gb.get("width_mm",  300))
+        bh = _in(gb.get("height_mm", 600))
+        span = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        if span < 0.01:
+            skipped.append(f"{gb.get('id','?')}: zero span ground beam")
+            continue
         lines.append(
-            f"ap_cylinder(ents, {x:.6f},{y:.6f},{z_pile_bot:.6f},{r:.6f},"
-            f"{_in(500):.6f},lyr_found,mat_conc)"
-            f"  # {f.get('id','')} @ {f.get('grid_ref','')}"
+            f"ap_beam(ents, {x1:.6f},{y1:.6f},{z_gbeam:.6f},"
+            f"{x2:.6f},{y2:.6f},{z_gbeam:.6f},"
+            f"{bw:.6f},{bh:.6f},lyr_gbeam,mat_conc)"
+            f"  # {gb.get('id','')} {gb.get('section_label','')} @ {gb.get('grid_ref','')}"
         )
-        counts["foundations"] += 1
+    lines.append("")
+
+    # ── Raft foundations ───────────────────────────────────────────────────────
+    lines += ["# ===== RAFT FOUNDATIONS ====="]
+    for rf in rafts:
+        x1   = _in(rf.get("x_from_mm", rf.get("x_mm", 0)))
+        y1   = _in(rf.get("y_from_mm", rf.get("y_mm", 0)))
+        x2   = _in(rf.get("x_to_mm",   rf.get("x_mm", 0)))
+        y2   = _in(rf.get("y_to_mm",   rf.get("y_mm", 0)))
+        t_rf = _in(rf.get("height_mm", 1000))
+        sw   = abs(x2 - x1)
+        sd   = abs(y2 - y1)
+        if sw < 0.01 or sd < 0.01:
+            skipped.append(f"{rf.get('id','?')}: zero area raft")
+            continue
+        z_rf_top = z_ground - _in(CAP_SETDOWN_MM)
+        z_rf_bot = z_rf_top - t_rf
+        lines.append(
+            f"ap_box(ents, {min(x1,x2):.6f},{min(y1,y2):.6f},{z_rf_bot:.6f},"
+            f"{sw:.6f},{sd:.6f},{t_rf:.6f},lyr_raft,mat_conc)"
+            f"  # {rf.get('id','')} {rf.get('label','')} raft"
+        )
     lines.append("")
 
     # ── Columns ───────────────────────────────────────────────────────────────
@@ -214,9 +382,12 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
     # ── Footer ─────────────────────────────────────────────────────────────────
     lines += [
         "model.commit_operation",
-        "puts 'auto_pipeline vector build: model loaded.'",
-        "puts \"Foundations:#{" + str(counts["foundations"]) + "} Columns:#{" +
-        str(counts["columns"]) + "} Beams:#{" + str(counts["beams"]) +
+        "puts 'auto_pipeline vector build complete.'",
+        "puts \"Foundations:#{" + str(counts["foundations"]) +
+        "} GroundBeams:#{" + str(len(ground_beams)) +
+        "} Rafts:#{" + str(len(rafts)) +
+        "} Columns:#{" + str(counts["columns"]) +
+        "} Beams:#{" + str(counts["beams"]) +
         "} Slabs:#{" + str(counts["slabs"]) + "}\"",
     ]
 
@@ -227,7 +398,7 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         "stage": 5,
         "stage_name": "Ruby Generator",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "elements_generated": counts,
+        "elements_generated": {**counts, "ground_beams": len(ground_beams), "rafts": len(rafts)},
         "ruby_line_count": len(lines),
         "warnings": warnings,
         "skipped": skipped,

@@ -89,8 +89,9 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     if progress_cb:
         progress_cb("classify", 1.0)
 
-    # ── Stage 2b: Grid extraction ─────────────────────────────────────────────
-    grid = extract_grids_from_pdf(pdf_path)
+    # ── Stage 2b: Grid extraction (scale-aware) ──────────────────────────────
+    dominant_scale = _detect_dominant_scale(classifications)
+    grid = extract_grids_from_pdf(pdf_path, dominant_scale=dominant_scale)
     if progress_cb:
         progress_cb("grid", 1.0)
 
@@ -290,6 +291,28 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         progress_cb("model", 1.0)
 
     return unified
+
+
+def _detect_dominant_scale(classifications: list[dict]) -> int:
+    """Return the dominant structural plan scale.
+
+    Prefers scales in the structural plan range (50–150) over site plan
+    scales (>200) or large-scale details (<30).
+    """
+    from collections import Counter
+    # Prefer typical structural plan scales (1:50–1:150)
+    struct = [
+        c["scale_ratio"] for c in classifications
+        if c.get("scale_ratio") and 50 <= c["scale_ratio"] <= 150
+    ]
+    if struct:
+        return Counter(struct).most_common(1)[0][0]
+    # Fallback: any non-extreme scale
+    any_s = [
+        c["scale_ratio"] for c in classifications
+        if c.get("scale_ratio") and 30 <= c["scale_ratio"] <= 250
+    ]
+    return Counter(any_s).most_common(1)[0][0] if any_s else 100
 
 
 def _generate_piles_from_grid(grid: dict) -> list[dict]:

@@ -174,12 +174,38 @@ def parse_footing_schedule(page: fitz.Page) -> dict[str, dict]:
         if ftype in ("pile_cap", "bored_pier"):
             entry["pile_dia_mm"] = _extract_pile_dia_from_row(row_text)
             entry["pile_len_mm"] = _extract_socket_len_from_row(row_text)
-            # Pile cap dimensions inferred from pile diameter
             if entry["pile_dia_mm"] > 0:
                 d = entry["pile_dia_mm"]
-                entry["width_mm"]  = round(d * 2.0)   # 2D cap width
+                entry["width_mm"]  = round(d * 2.0)
                 entry["depth_mm"]  = round(d * 2.0)
-                entry["height_mm"] = round(d * 0.93)  # ~0.93D cap depth
+                entry["height_mm"] = round(d * 0.93)
+
+        elif ftype == "pad_footing":
+            # Australian pad footing schedule: WxDxH inline (e.g. 1200x1200x450)
+            # or separate columns: WIDTH | LENGTH | DEPTH
+            dims = _parse_dims(row_text)
+            if dims:
+                entry["width_mm"]  = dims["width_mm"]
+                entry["depth_mm"]  = dims["depth_mm"]
+                entry["height_mm"] = dims["height_mm"] if dims["height_mm"] > 0 else 500.0
+            else:
+                # Fallback: first 3 numbers ≥ 300mm in row → W, D, H
+                nums = [float(t) for t, _ in row_items
+                        if _is_plain_number(t) and float(t) >= 300]
+                if len(nums) >= 3:
+                    entry["width_mm"]  = nums[0]
+                    entry["depth_mm"]  = nums[1]
+                    entry["height_mm"] = nums[2]
+                elif len(nums) == 2:
+                    entry["width_mm"]  = nums[0]
+                    entry["depth_mm"]  = nums[0]   # square if only one plan dim
+                    entry["height_mm"] = nums[1]
+
+        elif ftype == "strip_footing":
+            dims = _parse_dims(row_text)
+            if dims:
+                entry["width_mm"]  = dims["width_mm"]
+                entry["height_mm"] = dims["depth_mm"] if dims["depth_mm"] > 0 else 400.0
 
         elif ftype == "capping_beam":
             # CB1: 750 WIDTH × 600 DEPTH

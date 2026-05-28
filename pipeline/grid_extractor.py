@@ -41,13 +41,21 @@ def _extract_texts(page: fitz.Page) -> list[tuple[str, float, float, float]]:
 
 
 def extract_scale(page: fitz.Page) -> int | None:
-    """Find scale ratio from titleblock text, e.g. 'SCALE: 1 : 100' → 100."""
-    texts = _extract_texts(page)
+    """Find scale ratio from titleblock text, e.g. 'SCALE: 1 : 100' or '1:80' → int."""
+    texts   = _extract_texts(page)
     all_text = " ".join(t for t, *_ in texts)
-    # Must have the word SCALE (or NTS) to avoid matching grid labels "1 2 3"
+
+    # Primary: explicit SCALE keyword
     m = re.search(r"SCALE\s*[:\s]+\s*1\s*[:/\s]+\s*(\d{2,4})\b", all_text, re.I)
     if m:
         return int(m.group(1))
+
+    # Secondary: bare ratio "1 : 80", "1:80", "1/80" (no keyword needed)
+    # Require word boundary before the 1 and after the denominator
+    for m in re.finditer(r"(?<![:\d])\b1\s*[:/]\s*(\d{2,4})\b(?![\d:])", all_text):
+        val = int(m.group(1))
+        if 10 <= val <= 500:      # reasonable structural drawing scale
+            return val
     return None
 
 
@@ -66,9 +74,18 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
     w, h = page.rect.width, page.rect.height
     pt_to_mm = PT_TO_MM * scale
 
-    # Grid labels are: single character, large font (>14pt), near the drawing border
-    # Numbers (1,2,3...) appear near the TOP or BOTTOM border → X-axis grid
-    # Letters (A,B,C...) appear near the LEFT or RIGHT border → Y-axis grid
+    # Some PDFs (Bluebeam-combined) have content OUTSIDE the declared MediaBox.
+    # Expand content bounds to include all actual text before computing borders.
+    if texts:
+        content_h = max(h, max(y for _, _, y, _ in texts) + 10)
+        content_w = max(w, max(x for _, x, _, _ in texts) + 10)
+    else:
+        content_h, content_w = h, w
+
+    # Grid labels: large font (>12pt), near the drawing border.
+    # Support single-char (1, A) AND multi-char (AA, AB, 10, 11) labels.
+    # Numbers OR letters near TOP/BOTTOM  → X-axis (vertical grid lines).
+    # Letters near LEFT/RIGHT (but NOT top/bottom) → Y-axis (horizontal grid lines).
     x_candidates: list[tuple[str, float]] = []  # (label, x_pos)
     y_candidates: list[tuple[str, float]] = []  # (label, y_pos)
 
@@ -76,16 +93,26 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
         if sz < 12:  # skip small text
             continue
         clean = text.strip().upper()
-        if len(clean) != 1:
+        # Allow 1–3 character grid labels; must be all-digits or all-letters
+        if len(clean) == 0 or len(clean) > 3:
+            continue
+        if not (clean.isdigit() or clean.isalpha()):
             continue
 
-        # Grid number labels: near top border (y < 15% of height)
-        if clean.isdigit() and y < h * 0.15:
-            x_candidates.append((clean, x))
+        near_top_bot = (y < content_h * 0.15 or y > content_h * 0.85)
+        near_side    = (x < content_w * 0.12 or x > content_w * 0.65)
 
-        # Grid letter labels: near right border (x > 65% of width) or left border
-        elif clean.isalpha() and (x > w * 0.65 or x < w * 0.1):
-            y_candidates.append((clean, y))
+        if clean.isdigit() and near_top_bot:
+            # Numbers near top/bottom → X-axis (standard convention)
+            x_candidates.append((clean, x))
+        elif clean.isalpha():
+            if near_side and not near_top_bot:
+                # Single/multi-char letters at left/right only → Y-axis
+                y_candidates.append((clean, y))
+            elif near_top_bot and len(clean) > 1:
+                # Multi-char letters (AA, AB, BA...) at top/bottom edge → X-axis
+                # Skip single-char to avoid section marks (A-A, B-B cutlines)
+                x_candidates.append((clean, x))
 
     # Deduplicate by label (keep first occurrence per label)
     seen_x: dict[str, float] = {}
@@ -125,18 +152,36 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
     }
 
 
-def extract_grids_from_pdf(pdf_path: str, plan_page_indices: list[int] | None = None) -> dict:
+def extract_grids_from_pdf(
+    pdf_path: str,
+    plan_page_indices: list[int] | None = None,
+    dominant_scale: int | None = None,
+) -> dict:
     """Extract the best grid from the entire PDF.
 
-    Only uses pages at 1:100 scale (structural plan scale) to avoid
-    contamination from detail drawings at other scales.
+    Uses the dominant structural plan scale (auto-detected if not provided).
+    Accepts scales 50–250 so that 1:80 and 1:200 drawings are handled.
+    Detail pages at 1:5, 1:10, 1:20 are skipped automatically.
 
     plan_page_indices: 0-based page indices to restrict to (optional).
+    dominant_scale: override auto-detected scale (optional).
     """
-    doc = fitz.open(pdf_path)
-    master_scale = 100  # structural plans are always 1:100
+    from collections import Counter
 
-    # Count how many times each label appears across 1:100 pages
+    doc = fitz.open(pdf_path)
+
+    # Auto-detect dominant scale if not provided
+    if dominant_scale is None:
+        detected: list[int] = []
+        for i in range(doc.page_count):
+            s = extract_scale(doc[i])
+            if s is not None and 50 <= s <= 250:
+                detected.append(s)
+        dominant_scale = Counter(detected).most_common(1)[0][0] if detected else 100
+
+    master_scale = dominant_scale
+
+    # Count how many times each label appears across plan-scale pages
     label_count_x: dict[str, int] = {}
     label_count_y: dict[str, int] = {}
     all_x: dict[str, dict] = {}
@@ -149,9 +194,14 @@ def extract_grids_from_pdf(pdf_path: str, plan_page_indices: list[int] | None = 
 
         page = doc[i]
         page_scale = extract_scale(page)
-        # Only use 1:100 pages (skip detail pages at 1:10, 1:20 etc.)
-        if page_scale is not None and page_scale != master_scale:
-            continue
+        # Skip detail pages (< 50) and very small-scale overview pages (> 250)
+        # Also skip pages at scales very different from master (e.g. master=100, skip 20)
+        if page_scale is not None:
+            if page_scale < 50 or page_scale > 250:
+                continue
+            # Accept pages within 30% of master scale
+            if abs(page_scale - master_scale) / master_scale > 0.30:
+                continue
 
         g = extract_grid(page, master_scale)
         if not g["x_axes"] and not g["y_axes"]:
@@ -189,8 +239,8 @@ def extract_grids_from_pdf(pdf_path: str, plan_page_indices: list[int] | None = 
     doc.close()
 
     return {
-        "x_axes": _sort_labels(all_x),
-        "y_axes": _sort_labels(all_y),
+        "x_axes":  _sort_labels(all_x),
+        "y_axes":  _sort_labels(all_y),
         "scale": master_scale,
         "pt_to_mm": round(PT_TO_MM * master_scale, 4),
         "source_pages": source_pages,

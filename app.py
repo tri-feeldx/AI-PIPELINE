@@ -196,14 +196,38 @@ st.download_button(
     type="primary",
 )
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Foundations", report["elements_generated"]["foundations"])
-c2.metric("Columns",     report["elements_generated"]["columns"])
-c3.metric("Beams",       report["elements_generated"]["beams"])
-c4.metric("Slabs",       report["elements_generated"]["slabs"])
+eg = report["elements_generated"]
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Foundations", eg.get("foundations", 0))
+c2.metric("Rafts",       eg.get("rafts", 0))
+c3.metric("Gnd Beams",   eg.get("ground_beams", 0))
+c4.metric("Columns",     eg.get("columns", 0))
+c5.metric("Beams",       eg.get("beams", 0))
+c6.metric("Slabs",       eg.get("slabs", 0))
+
+# Foundation type breakdown
+fdn_schedule = unified.get("foundation_schedule", {})
+if fdn_schedule:
+    with st.expander("🔩  Foundation schedule extracted from PDF"):
+        rows = []
+        for lbl, spec in sorted(fdn_schedule.items()):
+            rows.append({
+                "Type": lbl,
+                "Category": spec.get("ftype", "?"),
+                "Dia (mm)": int(spec.get("pile_dia_mm", 0)) or "—",
+                "Socket (m)": round(spec.get("pile_len_mm", 0) / 1000, 1) or "—",
+                "Cap W×D (mm)": (
+                    f"{int(spec.get('width_mm',0))}×{int(spec.get('depth_mm',0))}"
+                    if spec.get("width_mm") else "—"
+                ),
+                "Cap H (mm)": int(spec.get("height_mm", 0)) or "—",
+            })
+        st.dataframe(rows, use_container_width=True)
 
 st.caption(
     f"Job: `data/jobs/{job_id}/`  |  "
+    f"Grid: {len(unified['grid_system']['x_axes'])}×{len(unified['grid_system']['y_axes'])}  |  "
+    f"Scale: 1:{unified['grid_system']['scale']}  |  "
     f"Ruby lines: {report['ruby_line_count']}  |  "
     f"Warnings: {len(report['warnings'])}"
 )

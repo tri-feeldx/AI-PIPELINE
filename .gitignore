@@ -1,0 +1,21 @@
+# Credentials — NEVER push these
+.env
+*.json
+!.env.example
+
+# Runtime data (job outputs, uploaded PDFs, page images)
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test/debug scripts
+test_*.py
+debug.py
+probe*.py
+
+# Misc
+*.zip
+gop_y.txt

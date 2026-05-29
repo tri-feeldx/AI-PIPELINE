@@ -200,42 +200,56 @@ def extract_foundations_vision(
     y_labels = [a["label"] for a in grid.get("y_axes", [])]
     known_marks = list(schedule.keys()) if schedule else []
 
-    prompt = f"""You are reading an Australian structural foundation plan drawing.
+    prompt = f"""You are a structural BIM engineer reading an Australian foundation plan drawing.
 
-The structural grid has:
-- X-axis labels (top/bottom): {x_labels}
-- Y-axis labels (left/right): {y_labels}
+The structural grid visible in this drawing has:
+- X-axis grid lines labelled (left→right): {x_labels if x_labels else '(detect from drawing)'}
+- Y-axis grid lines labelled (top→bottom): {y_labels if y_labels else '(detect from drawing)'}
 
-Foundation marks to find: {known_marks if known_marks else 'P1, P2, P3, PC1, PC2, F1, F2, F3, CB1, RF1 (any visible)'}
+Known foundation types from schedule: {known_marks if known_marks else 'detect from drawing (P1,P2,PC1,F1,F2,CB1,RF1 etc.)'}
 
-Find every foundation/pile cap annotation visible in the drawing.
-For each, identify:
-1. Its mark label (e.g. P1, PC2, F1)
-2. The nearest grid intersection (e.g. "A/1", "B/3")
-3. Its position as percent of image (x=left-to-right, y=top-to-bottom)
+TASK: Find every foundation annotation in the drawing.
+For EACH foundation:
+  1. Read its exact mark label (e.g. P1, PC2, F1)
+  2. Identify which grid intersection it sits ON — this is critical for accuracy.
+     grid_ref format = "Y_label/X_label" e.g. "A/1", "B/3", "AA/5"
+  3. ONLY if not on a grid intersection: record x_percent, y_percent (0.0–1.0 from top-left)
 
-Return ONLY valid JSON array:
+ACCURACY RULES:
+- A foundation sitting on grid line intersection A×1 → grid_ref="A/1", is_on_grid=true
+- A foundation between grid lines (off-grid) → grid_ref="off_grid", is_on_grid=false, give x_percent/y_percent
+- Do NOT guess grid_ref — if unsure, set is_on_grid=false
+- Count repeated marks (e.g. P1 appears at every exterior corner)
+
+Return ONLY valid JSON array, no explanation:
 [
   {{
     "label": "P1",
     "grid_ref": "A/1",
     "x_percent": 0.15,
     "y_percent": 0.22,
-    "is_on_grid": true
+    "is_on_grid": true,
+    "confidence": "high"
+  }},
+  {{
+    "label": "P1",
+    "grid_ref": "A/2",
+    "x_percent": 0.28,
+    "y_percent": 0.22,
+    "is_on_grid": true,
+    "confidence": "high"
   }},
   {{
     "label": "P3",
     "grid_ref": "off_grid",
     "x_percent": 0.05,
     "y_percent": 0.50,
-    "is_on_grid": false
+    "is_on_grid": false,
+    "confidence": "medium"
   }}
 ]
 
-Notes:
-- grid_ref format: Y_label/X_label (e.g. "A/1" means column A, row 1)
-- Use "off_grid" for foundations clearly not at an intersection
-- Include ALL visible foundation marks, even duplicates on the same grid point"""
+confidence: "high" = clearly on grid, "medium" = estimated, "low" = uncertain"""
 
     png = _page_to_png(page)
     for attempt in range(_MAX_RETRIES):
@@ -296,6 +310,7 @@ def _convert_vision_fdns_to_model(
         spec = schedule.get(label, {})
         ftype = spec.get("ftype", "pile_cap")
 
+        confidence = vf.get("confidence", "medium")
         result.append({
             "id": f"AI-{label}-{i:03d}",
             "ftype": ftype,
@@ -311,6 +326,7 @@ def _convert_vision_fdns_to_model(
             "height_mm":    spec.get("height_mm", 700),
             "material":     "concrete",
             "source":       "vision_ai",
+            "needs_review": confidence == "low",
         })
 
     return result

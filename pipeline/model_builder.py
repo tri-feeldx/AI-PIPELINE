@@ -103,8 +103,9 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     all_beams:   list[dict] = []
     all_slabs:   list[dict] = []
 
-    # Foundation extraction results (from foundation_plan page, if present)
-    foundation_extraction: dict = {}
+    # Foundation extraction results — collect ALL foundation_plan pages,
+    # then merge with X-offset so multi-building PDFs include every building.
+    all_fdn_results: list[dict] = []
 
     for idx, cls in enumerate(classifications):
         page_num  = cls["page_num"]
@@ -134,11 +135,8 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
                         fdn_result = _vision_fallback(
                             page, active_grid, fdn_result, quality
                         )
-
-                    if len(fdn_result.get("footings", [])) > len(
-                        foundation_extraction.get("footings", [])
-                    ):
-                        foundation_extraction = fdn_result
+                    # Collect every foundation page (multi-building support)
+                    all_fdn_results.append(fdn_result)
         else:
             elements = {"columns": [], "beams": [], "slabs": []}
 
@@ -182,9 +180,11 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         progress_cb("levels", 1.0)
 
     # ── Stage 4b: Foundation elements ────────────────────────────────────────
-    # Priority: use data extracted directly from a foundation_plan page.
-    # Fall back to auto-generating at every grid intersection only when
-    # no foundation_plan page was found in the PDF.
+    # Merge ALL foundation pages (handles multi-building PDFs).
+    # Falls back to grid-intersection generation only when no foundation
+    # plan page was found at all.
+    foundation_extraction = _merge_foundation_pages(all_fdn_results)
+
     ai_used = {
         "grid":        foundation_extraction.get("_vision_grid", False),
         "schedule":    foundation_extraction.get("_vision_schedule", False),
@@ -305,6 +305,77 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         progress_cb("model", 1.0)
 
     return unified
+
+
+def _merge_foundation_pages(results: list[dict]) -> dict:
+    """Merge foundations from all foundation_plan pages.
+
+    For multi-building PDFs each page is a separate building.
+    Normalises each building to its own (0,0) origin then places
+    buildings side-by-side with a 5 m gap so they don't overlap in SketchUp.
+    Single-building PDFs (1 result) are returned unchanged.
+    """
+    if not results:
+        return {}
+    if len(results) == 1:
+        return results[0]
+
+    all_footings: list[dict] = []
+    all_gbeams:   list[dict] = []
+    all_rafts:    list[dict] = []
+    merged_schedule: dict = {}
+
+    x_cursor = 0.0
+
+    for bldg_idx, r in enumerate(results):
+        footings = r.get("footings", [])
+        if not footings:
+            merged_schedule.update(r.get("schedule", {}))
+            continue
+
+        xs = [f.get("x_mm", 0) for f in footings]
+        ys = [f.get("y_mm", 0) for f in footings]
+        x_min, x_max = min(xs), max(xs)
+        y_min = min(ys)
+        bldg_width = max(x_max - x_min, 10_000)  # floor at 10 m
+
+        for f in footings:
+            nf = dict(f)
+            nf["x_mm"] = round(f["x_mm"] - x_min + x_cursor, 1)
+            nf["y_mm"] = round(f["y_mm"] - y_min, 1)
+            nf["building_idx"] = bldg_idx
+            all_footings.append(nf)
+
+        for gb in r.get("ground_beams", []):
+            ngb = dict(gb)
+            ngb["from_x_mm"] = round(gb.get("from_x_mm", 0) - x_min + x_cursor, 1)
+            ngb["to_x_mm"]   = round(gb.get("to_x_mm",   0) - x_min + x_cursor, 1)
+            ngb["from_y_mm"] = round(gb.get("from_y_mm", 0) - y_min, 1)
+            ngb["to_y_mm"]   = round(gb.get("to_y_mm",   0) - y_min, 1)
+            all_gbeams.append(ngb)
+
+        for rf in r.get("rafts", []):
+            nrf = dict(rf)
+            nrf["x_from_mm"] = round(rf.get("x_from_mm", 0) - x_min + x_cursor, 1)
+            nrf["x_to_mm"]   = round(rf.get("x_to_mm",   0) - x_min + x_cursor, 1)
+            nrf["y_from_mm"] = round(rf.get("y_from_mm", 0) - y_min, 1)
+            nrf["y_to_mm"]   = round(rf.get("y_to_mm",   0) - y_min, 1)
+            all_rafts.append(nrf)
+
+        merged_schedule.update(r.get("schedule", {}))
+        x_cursor += bldg_width + 5_000   # 5 m gap between buildings
+
+    return {
+        "footings":     all_footings,
+        "ground_beams": all_gbeams,
+        "rafts":        all_rafts,
+        "schedule":     merged_schedule,
+        "pile_spec":    results[0].get("pile_spec", {}),
+        "has_foundation_plan": True,
+        "_vision_foundations": any(r.get("_vision_foundations") for r in results),
+        "_vision_schedule":    any(r.get("_vision_schedule")    for r in results),
+        "_vision_grid":        any(r.get("_vision_grid")        for r in results),
+    }
 
 
 def _vision_fallback(

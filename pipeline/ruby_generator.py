@@ -93,6 +93,7 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
 
     skipped  = []
     warnings = []
+    _warned_pile_dia: set = set()  # deduplicate pile_dia warnings per foundation type
     lines    = []
     counts   = {"columns": 0, "beams": 0, "slabs": 0, "foundations": 0, "ground_beams": 0}
 
@@ -223,10 +224,14 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
             _standards = [450, 500, 600, 650, 750, 900, 1050, 1200]
             pile_dia = min(_standards, key=lambda s: abs(s - _est)) if _est > 200 else 600
             pile_len = f.get("pile_len_mm", 0) or 8000  # 8m default if missing
-            warnings.append(
-                f"{fid}: pile_dia estimated {pile_dia}mm from cap "
-                f"(refer to geotech report for actual spec)"
-            )
+            # Warn once per foundation type label (not once per instance)
+            warn_key = f.get("label", ftype)
+            if warn_key not in _warned_pile_dia:
+                _warned_pile_dia.add(warn_key)
+                warnings.append(
+                    f"{warn_key}: pile_dia estimated {pile_dia}mm from cap size "
+                    f"— refer to geotechnical report for actual pile specification"
+                )
 
         # Guard: use sensible fallbacks if dimensions are zero (failed extraction)
         if cap_w < 1e-6:

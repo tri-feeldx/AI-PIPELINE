@@ -11,13 +11,9 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env")   # absolute path — works regardless of CWD
 
 import streamlit as st
-
-from pipeline.model_builder import build_model
-from pipeline.ruby_generator import generate_ruby
-from pipeline.pdf_converter import convert_pdf_to_images
 
 JOBS_DIR = Path("data/jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -74,6 +70,12 @@ run_btn = st.button("▶  Run Vector Pipeline", type="primary")
 
 if not run_btn:
     st.stop()
+
+# ── Import pipeline modules here (NOT at top level) ───────────────────────────
+# Streamlit hot-reload clears sys.modules mid-load when imports are at module
+# level — moving them inside the run handler avoids KeyError: 'pipeline.*'.
+from pipeline.model_builder import build_model
+from pipeline.ruby_generator import generate_ruby
 
 # ── Job setup ─────────────────────────────────────────────────────────────────
 job_id = str(uuid.uuid4())[:8]

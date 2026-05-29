@@ -65,6 +65,7 @@ def _call_gemini(image_bytes: bytes, prompt: str) -> str:
         config=types.GenerateContentConfig(
             temperature=0.0,
             response_mime_type="application/json",
+            max_output_tokens=8192,   # prevent JSON truncation on large pages
         ),
     )
     return response.text
@@ -125,16 +126,37 @@ def _page_to_tiles(
 
 
 def _parse_json(text: str) -> dict | list | None:
-    """Parse JSON from model output, stripping markdown fences if present."""
+    """Parse JSON from model output, stripping markdown fences if present.
+
+    If the full response is truncated mid-JSON (Gemini output limit exceeded),
+    attempts to salvage all complete objects from an array before the cut.
+    """
     text = text.strip()
     # Strip ```json ... ``` fences
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
+
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
         logger.warning("JSON parse error from Gemini: %s | text[:200]=%s", e, text[:200])
-        return None
+
+    # Partial-JSON recovery: truncated array → strip last incomplete object
+    # e.g. [..., {"label": "D-CC04", "grid_ref": "Y1   ← cut here
+    try:
+        # Remove trailing incomplete object: from last ',' or '[' before a cut '{'
+        salvaged = re.sub(r",\s*\{[^}]*$", "", text.strip().rstrip(","))
+        if not salvaged.startswith("["):
+            salvaged = "[" + salvaged
+        if not salvaged.endswith("]"):
+            salvaged += "]"
+        result = json.loads(salvaged)
+        logger.warning("Partial-JSON recovery succeeded: %d items recovered", len(result) if isinstance(result, list) else 1)
+        return result
+    except Exception:
+        pass
+
+    return None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────

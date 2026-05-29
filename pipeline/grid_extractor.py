@@ -20,6 +20,51 @@ import fitz
 PT_TO_MM = 25.4 / 72.0  # 1 PDF point in millimetres
 
 
+def _is_valid_grid_axis(sorted_by_pos: list[tuple[str, float]]) -> bool:
+    """Universal structural grid validity — two physical principles:
+
+    A) Monotonic order: column/row labels in position order must also be in
+       value order (column 3 is always right of column 2).
+    B) Spacing uniformity: structural bays are approximately equal
+       (coefficient of variation of gaps must be < 0.60).
+
+    Rejects page reference numbers, detail callout numbers, and other
+    non-grid text that passes font-size and border-proximity filters.
+    """
+    if len(sorted_by_pos) < 2:
+        return False
+
+    labels    = [lbl for lbl, _ in sorted_by_pos]
+    positions = [pos for _, pos in sorted_by_pos]
+
+    # Principle A: value order matches position order
+    if all(lbl.isdigit() for lbl in labels):
+        vals = [int(lbl) for lbl in labels]
+        n    = len(vals)
+        inversions = sum(
+            1 for i in range(n) for j in range(i + 1, n) if vals[i] > vals[j]
+        )
+        total_pairs = n * (n - 1) / 2
+        if inversions / total_pairs > 0.30:
+            return False   # >30% inversions → reference numbers, not grid
+    elif all(lbl.isalpha() and len(lbl) == 1 for lbl in labels):
+        for i in range(len(labels) - 1):
+            if ord(labels[i + 1]) - ord(labels[i]) > 3:
+                return False   # alphabet gap > 3 → not a sequential grid
+
+    # Principle B: spacing uniformity (CV < 0.60)
+    if len(positions) >= 3:
+        gaps     = [positions[i + 1] - positions[i] for i in range(len(positions) - 1)]
+        mean_gap = sum(gaps) / len(gaps)
+        if mean_gap > 0:
+            variance = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
+            cv = (variance ** 0.5) / mean_gap
+            if cv > 0.60:
+                return False   # irregular spacing → not a grid axis
+
+    return True
+
+
 class GridAxis(NamedTuple):
     label: str
     pdf_pos: float   # position on PDF page (x for vertical grid lines, y for horizontal)
@@ -100,7 +145,7 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
             continue
 
         near_top_bot = (y < content_h * 0.15 or y > content_h * 0.85)
-        near_side    = (x < content_w * 0.12 or x > content_w * 0.65)
+        near_side    = (x < content_w * 0.15 or x > content_w * 0.65)
 
         if clean.isdigit() and near_top_bot:
             # Numbers near top/bottom → X-axis (standard convention)
@@ -125,9 +170,13 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
         if label not in seen_y:
             seen_y[label] = pos
 
-    # Sort by position
-    sorted_x = sorted(seen_x.items(), key=lambda a: a[1])  # by x pos
-    sorted_y = sorted(seen_y.items(), key=lambda a: a[1])  # by y pos
+    # Sort by position, then validate as genuine structural grid axes
+    sorted_x = sorted(seen_x.items(), key=lambda a: a[1])
+    sorted_y = sorted(seen_y.items(), key=lambda a: a[1])
+    if not _is_valid_grid_axis(sorted_x):
+        sorted_x = []   # rejects page ref numbers / detail callouts
+    if not _is_valid_grid_axis(sorted_y):
+        sorted_y = []
 
     # Build zero-based real mm coordinates
     def _to_real(items: list[tuple[str, float]], base_pos: float) -> list[dict]:
@@ -226,10 +275,15 @@ def extract_grids_from_pdf(
     all_x = {k: v for k, v in all_x.items() if label_count_x.get(k, 0) >= min_count}
     all_y = {k: v for k, v in all_y.items() if label_count_y.get(k, 0) >= min_count}
 
-    # Sort and re-zero-base
+    # Sort, validate merged axis (re-run after multi-page merge), and re-zero-base
     def _sort_labels(axes: dict[str, dict]) -> list[dict]:
         items = sorted(axes.values(), key=lambda a: a["pdf_pos"])
         if not items:
+            return []
+        # Re-validate the merged set: page-level validation may pass on
+        # small subsets, but the merged labels must also be globally valid.
+        pairs = [(a["label"], a["pdf_pos"]) for a in items]
+        if not _is_valid_grid_axis(pairs):
             return []
         base = items[0]["real_mm"]
         for a in items:

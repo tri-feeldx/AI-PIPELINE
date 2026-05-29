@@ -87,6 +87,16 @@ pdf_path.write_bytes(uploaded.read())
 
 st.success(f"Job `{job_id}` — {pdf_path.stat().st_size // 1024} KB uploaded")
 
+# ── Per-job log file ──────────────────────────────────────────────────────────
+import logging as _logging
+_log_path = job_dir / "pipeline.log"
+_file_handler = _logging.FileHandler(_log_path, encoding="utf-8")
+_file_handler.setLevel(_logging.DEBUG)
+_file_handler.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+_root_logger = _logging.getLogger()
+_root_logger.addHandler(_file_handler)
+_root_logger.setLevel(_logging.DEBUG)
+
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 stage_status = {
     "classify": st.empty(),
@@ -195,14 +205,28 @@ with col_right:
 st.divider()
 st.success("✅  Pipeline complete!")
 
+# Close and remove the per-job log handler
+_root_logger.removeHandler(_file_handler)
+_file_handler.close()
+
 rb_bytes = (job_dir / "sketchup_model.rb").read_bytes()
-st.download_button(
-    "⬇️  Download sketchup_model.rb",
-    data=rb_bytes,
-    file_name="sketchup_model.rb",
-    mime="text/plain",
-    type="primary",
-)
+col_dl1, col_dl2 = st.columns(2)
+with col_dl1:
+    st.download_button(
+        "⬇️  Download sketchup_model.rb",
+        data=rb_bytes,
+        file_name="sketchup_model.rb",
+        mime="text/plain",
+        type="primary",
+    )
+with col_dl2:
+    if _log_path.exists():
+        st.download_button(
+            "⬇️  Download pipeline.log",
+            data=_log_path.read_bytes(),
+            file_name=f"pipeline_{job_id}.log",
+            mime="text/plain",
+        )
 
 eg = report["elements_generated"]
 c1, c2, c3, c4, c5, c6 = st.columns(6)

@@ -540,7 +540,7 @@ def detect_ground_beams(page: fitz.Page, grid: dict) -> list[dict]:
 
 # ── Main entry point ───────────────────────────────────────────────────────────
 
-def extract_foundations(page: fitz.Page, grid: dict) -> dict:
+def extract_foundations(page: fitz.Page, grid: dict, global_schedule: dict | None = None) -> dict:
     """Extract all foundation elements from a foundation-plan page.
 
     Returns:
@@ -555,7 +555,16 @@ def extract_foundations(page: fitz.Page, grid: dict) -> dict:
     y_axes = grid.get("y_axes", [])
     pt_mm  = grid.get("pt_to_mm", PT_TO_MM * 100)
 
-    schedule      = parse_footing_schedule(page)
+    # Parse schedule from this page, then merge with pre-built global schedule.
+    # Global schedule wins for entries where page-level data has zero dims.
+    page_schedule = parse_footing_schedule(page)
+    schedule = dict(global_schedule) if global_schedule else {}
+    for mark, spec in page_schedule.items():
+        existing = schedule.get(mark, {})
+        if (spec.get("width_mm", 0) > existing.get("width_mm", 0)
+                or spec.get("pile_dia_mm", 0) > existing.get("pile_dia_mm", 0)):
+            schedule[mark] = spec
+
     pile_spec     = find_pile_spec_global(page)
     on_grid, off_grid_anns = find_all_pile_annotations(page, grid)
     ground_beams  = detect_ground_beams(page, grid)

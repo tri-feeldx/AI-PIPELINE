@@ -19,7 +19,7 @@ from pipeline.page_classifier import classify_all_pages
 from pipeline.grid_extractor import extract_grids_from_pdf, extract_grid, PT_TO_MM
 from pipeline.element_detector import detect_elements
 from pipeline.level_extractor import extract_levels_from_pdf
-from pipeline.foundation_extractor import extract_foundations
+from pipeline.foundation_extractor import extract_foundations, parse_footing_schedule
 from pipeline.quality_gate import assess_quality
 
 
@@ -90,7 +90,25 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     if progress_cb:
         progress_cb("classify", 1.0)
 
-    # ── Stage 2b: Grid extraction (scale-aware) ──────────────────────────────
+    # ── Stage 2b: Global foundation schedule pre-scan ────────────────────────
+    # Parse schedule from ALL pages (schedule, detail, foundation_plan).
+    # This captures pile cap / pad footing tables that sit on dedicated
+    # schedule pages (e.g. ST-003-31 "Foundation Sections and Details")
+    # which are not processed by the per-page foundation extractor.
+    global_schedule: dict = {}
+    _sched_types = {"schedule", "detail", "foundation_plan"}
+    for cls in classifications:
+        if cls["drawing_type"] in _sched_types:
+            pg = doc[cls["page_num"] - 1]
+            sched = parse_footing_schedule(pg)
+            for mark, spec in sched.items():
+                # Keep entry with most complete data
+                existing = global_schedule.get(mark, {})
+                if (spec.get("width_mm", 0) > existing.get("width_mm", 0)
+                        or spec.get("pile_dia_mm", 0) > existing.get("pile_dia_mm", 0)):
+                    global_schedule[mark] = spec
+
+    # ── Stage 2c: Grid extraction (scale-aware) ───────────────────────────────
     dominant_scale = _detect_dominant_scale(classifications)
     grid = extract_grids_from_pdf(pdf_path, dominant_scale=dominant_scale)
     if progress_cb:
@@ -126,7 +144,7 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             # beats Footing Details at 1:20 which appears first in page order).
             if page_type == "foundation_plan":
                 active_grid = page_grid if page_grid["x_axes"] else grid
-                fdn_result = extract_foundations(page, active_grid)
+                fdn_result = extract_foundations(page, active_grid, global_schedule)
 
                 # Quality gate — try Vision AI if vector result is poor
                 if fdn_result.get("has_foundation_plan"):

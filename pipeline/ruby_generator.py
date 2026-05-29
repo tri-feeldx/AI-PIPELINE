@@ -192,6 +192,18 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         gref       = f.get("grid_ref", "")
         fid        = f.get("id", "")
 
+        # For pile caps: estimate pile diameter from cap size when not in schedule.
+        # Cap is typically 2×pile_dia; CFA standard sizes: 450/500/600/650/750mm.
+        if ftype in ("pile_cap", "pile") and pile_dia == 0 and cap_w > 0:
+            _est = (f.get("width_mm", 0) + f.get("depth_mm", 0)) / 2 * 0.45
+            _standards = [450, 500, 600, 650, 750, 900, 1050, 1200]
+            pile_dia = min(_standards, key=lambda s: abs(s - _est)) if _est > 200 else 600
+            pile_len = f.get("pile_len_mm", 0) or 8000  # 8m default if missing
+            warnings.append(
+                f"{fid}: pile_dia estimated {pile_dia}mm from cap "
+                f"(refer to geotech report for actual spec)"
+            )
+
         # Guard: use sensible fallbacks if dimensions are zero (failed extraction)
         if cap_w < 1e-6:
             cap_w = _in(1500)

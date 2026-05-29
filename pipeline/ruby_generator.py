@@ -82,6 +82,33 @@ def _pile_offsets(pile_count: int, dia_mm: float) -> list[tuple[float, float]]:
     return positions
 
 
+def _validate_model(foundations: list, schedule: dict, warnings: list) -> None:
+    """Append warnings for unrealistic or incomplete foundation data."""
+    for f in foundations:
+        fid = f.get("id", "?")
+        if f.get("width_mm", 0) <= 0 or f.get("depth_mm", 0) <= 0:
+            warnings.append(f"ZERO_DIMS:{fid} — width/depth will be defaulted")
+        if f.get("ftype") == "pile_cap" and f.get("pile_dia_mm", 0) == 0:
+            warnings.append(f"PILE_DIA_MISSING:{fid}")
+        if f.get("height_mm", 0) > 5000:
+            warnings.append(f"UNREALISTIC_HEIGHT:{fid} height={f['height_mm']}mm")
+        if f.get("needs_review"):
+            warnings.append(f"NEEDS_REVIEW:{fid} — position approximate, verify against drawing")
+    if foundations:
+        count = len(foundations)
+        types = {}
+        for f in foundations:
+            types[f.get("ftype", "unknown")] = types.get(f.get("ftype", "unknown"), 0) + 1
+        warnings_pre = len(warnings)
+        # Sanity: more than 400 foundations is almost certainly a false-positive flood
+        if count > 400:
+            warnings.append(f"FOUNDATION_COUNT_HIGH:{count} — likely includes false positives")
+        # Sanity: all foundations same label suggests grid-fill fallback triggered
+        labels = {f.get("label") for f in foundations}
+        if labels == {"AUTO"}:
+            warnings.append("ALL_AUTO_LABEL — grid-fill fallback used; position accuracy unverified")
+
+
 def generate_ruby(model: dict, job_dir: str) -> dict:
     """Generate .rb and report. Returns report dict."""
     job_dir = Path(job_dir)
@@ -510,6 +537,9 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         })
         counts["slabs"] += 1
     lines.append("")
+
+    # ── Post-generation validation ────────────────────────────────────────────
+    _validate_model(foundations, model.get("schedule", {}), warnings)
 
     # ── Footer ─────────────────────────────────────────────────────────────────
     lines += [

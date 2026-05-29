@@ -229,19 +229,23 @@ def extract_schedule_vision(page: fitz.Page) -> list[dict] | None:
     Returns list of schedule entries matching foundation_extractor schema.
     Returns None on failure.
     """
-    prompt = """You are reading an Australian structural engineering drawing.
+    prompt = """You are reading a structural engineering drawing (may be Australian or Vietnamese).
 Find the pile/footing schedule table in this image (if present).
 
-The table typically has columns like:
-MARK | PILE SIZE/DIA | SOCKET LENGTH | NO. OF PILES | CAP SIZE (WxDxH) | etc.
-OR for pad footings:
-MARK | WIDTH | LENGTH | DEPTH | REINFORCEMENT
+The table may use English OR Vietnamese headers:
+English: MARK | PILE SIZE/DIA | SOCKET LENGTH | NO. OF PILES | CAP SIZE (WxDxH) | etc.
+Vietnamese: MÁC / KÝ HIỆU | ĐƯỜNG KÍNH CỌC / ĐK | CHIỀU SÂU / SỐ LƯỢNG | KÍCH THƯỚC ĐÀI | etc.
+
+Dimension formats you may see:
+- English: 1500x1500x700, Ø750, 750mm
+- Vietnamese: BxH=1200x700 (cap dimensions), ĐK600 or Φ600 (pile diameter), 1200×700
 
 Parse every row and classify each mark:
-- P1, P2, PC1, PC2 → "pile_cap"
-- F1, F2, F3 → "pad_footing"
-- CB1, CB2 → "capping_beam"
+- P1, P2, PC1, PC2, MC1, MD1 → "pile_cap"
+- F1, F2, F3, PF1 → "pad_footing"
+- CB1, CB2, DM1, DG1 → "capping_beam"
 - RF1, RF2, RS1 → "raft"
+- MB1, SF1 → "strip_footing"
 
 Return ONLY valid JSON array (empty array [] if no schedule found):
 [
@@ -273,6 +277,49 @@ Rules:
     return data if isinstance(data, list) else None
 
 
+def _build_synthetic_grid(vision_grid_data: dict, page: fitz.Page) -> dict:
+    """Convert extract_grid_vision() result (x_percent/y_percent) to real_mm grid dict.
+
+    Vision AI returns grid label positions as fractions of page dimensions.
+    We convert to pdf_pts then to real_mm using the scale found (or 100).
+    The result has the same schema as grid_extractor.extract_grid().
+    """
+    from pipeline.grid_extractor import PT_TO_MM
+
+    pw = page.rect.width
+    ph = page.rect.height
+    scale = int(vision_grid_data.get("scale", 100))
+    pt_to_mm = PT_TO_MM * scale
+
+    raw_x = vision_grid_data.get("x_axes", [])
+    raw_y = vision_grid_data.get("y_axes", [])
+
+    def _to_axes(items: list[dict], key: str, page_dim: float, is_y: bool) -> list[dict]:
+        converted = []
+        for ax in items:
+            pct = float(ax.get(key, 0.5))
+            pdf_pos = pct * page_dim
+            converted.append({"label": str(ax.get("label", "?")), "pdf_pos": round(pdf_pos, 2)})
+        converted.sort(key=lambda a: a["pdf_pos"])
+        if not converted:
+            return []
+        base = converted[0]["pdf_pos"]
+        for a in converted:
+            a["real_mm"] = round((a["pdf_pos"] - base) * pt_to_mm, 1)
+        return converted
+
+    x_axes = _to_axes(raw_x, "x_percent", pw, False)
+    y_axes = _to_axes(raw_y, "y_percent", ph, True)
+
+    return {
+        "x_axes": x_axes,
+        "y_axes": y_axes,
+        "scale": scale,
+        "pt_to_mm": round(pt_to_mm, 4),
+        "source": "vision_synthetic",
+    }
+
+
 def extract_foundations_vision(
     page: fitz.Page,
     grid: dict,
@@ -285,6 +332,20 @@ def extract_foundations_vision(
     Returns list of foundation dicts (same schema as foundation_extractor output).
     Returns None on failure.
     """
+    # If vector grid extraction failed (empty axes), build a synthetic grid from
+    # Vision AI so that grid-snapping in _convert_vision_fdns_to_model works.
+    if not grid.get("x_axes") and not grid.get("y_axes"):
+        logger.info("extract_foundations_vision: vector grid empty — calling extract_grid_vision first")
+        vision_grid_data = extract_grid_vision(page)
+        if vision_grid_data and (vision_grid_data.get("x_axes") or vision_grid_data.get("y_axes")):
+            grid = _build_synthetic_grid(vision_grid_data, page)
+            logger.info(
+                "extract_foundations_vision: synthetic grid built — %d x-axes, %d y-axes",
+                len(grid["x_axes"]), len(grid["y_axes"]),
+            )
+        else:
+            logger.warning("extract_foundations_vision: grid extraction (vision) also failed — positions will be approximate")
+
     x_labels = [a["label"] for a in grid.get("x_axes", [])]
     y_labels = [a["label"] for a in grid.get("y_axes", [])]
     known_marks = list(schedule.keys()) if schedule else []

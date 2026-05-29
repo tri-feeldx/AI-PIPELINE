@@ -424,6 +424,14 @@ def _merge_foundation_pages(results: list[dict]) -> dict:
             nf["x_mm"] = round(f["x_mm"] - x_min + x_cursor, 1)
             nf["y_mm"] = round(f["y_mm"] - y_min, 1)
             nf["building_idx"] = bldg_idx
+            # Unify schema: add bounding box fields (same as rafts) so ruby_generator
+            # can use a single code path. Single-point footings: from == to == center.
+            half_w = f.get("width_mm", 0) / 2
+            half_d = f.get("depth_mm", 0) / 2
+            nf.setdefault("x_from_mm", round(nf["x_mm"] - half_w, 1))
+            nf.setdefault("x_to_mm",   round(nf["x_mm"] + half_w, 1))
+            nf.setdefault("y_from_mm", round(nf["y_mm"] - half_d, 1))
+            nf.setdefault("y_to_mm",   round(nf["y_mm"] + half_d, 1))
             all_footings.append(nf)
 
         for gb in r.get("ground_beams", []):
@@ -445,6 +453,8 @@ def _merge_foundation_pages(results: list[dict]) -> dict:
         merged_schedule.update(r.get("schedule", {}))
         x_cursor += bldg_width + 5_000   # 5 m gap between buildings
 
+    all_footings = _deduplicate_footings(all_footings)
+
     return {
         "footings":        all_footings,
         "ground_beams":    all_gbeams,
@@ -458,6 +468,29 @@ def _merge_foundation_pages(results: list[dict]) -> dict:
         "_vision_schedule":    any(r.get("_vision_schedule")    for r in results),
         "_vision_grid":        any(r.get("_vision_grid")        for r in results),
     }
+
+
+def _deduplicate_footings(footings: list[dict], tol_mm: float = 150.0) -> list[dict]:
+    """Remove duplicate foundations (same label within tol_mm of each other).
+
+    Prefers source='vector' entries over source='vision_ai' entries.
+    Common cause: same foundation appears on overlapping PDF pages or in
+    both tiled Vision AI response and vector extraction.
+    """
+    # Sort so vector entries come first (they are more reliable)
+    ordered = sorted(footings, key=lambda f: 0 if f.get("source") != "vision_ai" else 1)
+    seen: list[dict] = []
+    for f in ordered:
+        fx, fy, fl = f.get("x_mm", 0), f.get("y_mm", 0), f.get("label", "")
+        duplicate = any(
+            abs(fx - s.get("x_mm", 0)) < tol_mm
+            and abs(fy - s.get("y_mm", 0)) < tol_mm
+            and fl == s.get("label", "")
+            for s in seen
+        )
+        if not duplicate:
+            seen.append(f)
+    return seen
 
 
 def _vision_fallback(

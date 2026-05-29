@@ -11,10 +11,13 @@ Scale formula:
 Output: grid dict with x_axes and y_axes in real mm, zero-based.
 """
 
+import logging
 import re
 from typing import NamedTuple
 
 import fitz
+
+_log = logging.getLogger(__name__)
 
 
 PT_TO_MM = 25.4 / 72.0  # 1 PDF point in millimetres
@@ -49,8 +52,8 @@ def _is_valid_grid_axis(sorted_by_pos: list[tuple[str, float]]) -> bool:
             return False   # >30% inversions → reference numbers, not grid
     elif all(lbl.isalpha() and len(lbl) == 1 for lbl in labels):
         for i in range(len(labels) - 1):
-            if ord(labels[i + 1]) - ord(labels[i]) > 3:
-                return False   # alphabet gap > 3 → not a sequential grid
+            if ord(labels[i + 1]) - ord(labels[i]) > 6:
+                return False   # alphabet gap > 6 → not a sequential grid (was 3)
 
     # Principle B: spacing uniformity (CV < 0.60)
     if len(positions) >= 3:
@@ -59,8 +62,8 @@ def _is_valid_grid_axis(sorted_by_pos: list[tuple[str, float]]) -> bool:
         if mean_gap > 0:
             variance = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
             cv = (variance ** 0.5) / mean_gap
-            if cv > 0.60:
-                return False   # irregular spacing → not a grid axis
+            if cv > 0.80:
+                return False   # irregular spacing → not a grid axis (was 0.60; VN structures have varied bays)
 
     return True
 
@@ -127,7 +130,7 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
     else:
         content_h, content_w = h, w
 
-    # Grid labels: large font (>12pt), near the drawing border.
+    # Grid labels: large font (>7pt), near the drawing border.
     # Support single-char (1, A) AND multi-char (AA, AB, 10, 11) labels.
     # Numbers OR letters near TOP/BOTTOM  → X-axis (vertical grid lines).
     # Letters near LEFT/RIGHT (but NOT top/bottom) → Y-axis (horizontal grid lines).
@@ -135,7 +138,7 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
     y_candidates: list[tuple[str, float]] = []  # (label, y_pos)
 
     for text, x, y, sz in texts:
-        if sz < 12:  # skip small text
+        if sz < 7:  # Vietnamese PDFs encode grid labels at 8-11pt; was 12
             continue
         clean = text.strip().upper()
         # Allow 1–3 character grid labels; must be all-digits or all-letters
@@ -174,8 +177,10 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
     sorted_x = sorted(seen_x.items(), key=lambda a: a[1])
     sorted_y = sorted(seen_y.items(), key=lambda a: a[1])
     if not _is_valid_grid_axis(sorted_x):
+        _log.debug("grid_extractor: x-axis rejected — labels=%s", [l for l, _ in sorted_x])
         sorted_x = []   # rejects page ref numbers / detail callouts
     if not _is_valid_grid_axis(sorted_y):
+        _log.debug("grid_extractor: y-axis rejected — labels=%s", [l for l, _ in sorted_y])
         sorted_y = []
 
     # Build zero-based real mm coordinates
@@ -275,6 +280,21 @@ def extract_grids_from_pdf(
     all_x = {k: v for k, v in all_x.items() if label_count_x.get(k, 0) >= min_count}
     all_y = {k: v for k, v in all_y.items() if label_count_y.get(k, 0) >= min_count}
 
+    # Per-page fallback: if global multi-page merge filtered everything out,
+    # try extracting the grid from each plan page individually.
+    # Common cause: 4-building PDFs where each building has unique grid labels
+    # that only appear on 1 page and get filtered by min_count=2.
+    if not all_x and not all_y and plan_page_indices:
+        for i in plan_page_indices:
+            if i >= doc.page_count:
+                continue
+            g = extract_grid(doc[i], master_scale)
+            if g["x_axes"] or g["y_axes"]:
+                _log.debug("grid_extractor: per-page fallback succeeded on page %d", i + 1)
+                doc.close()
+                return {**g, "source_pages": [i + 1], "per_page_fallback": True}
+        _log.warning("grid_extractor: all extraction strategies failed — no grid found")
+
     # Sort, validate merged axis (re-run after multi-page merge), and re-zero-base
     def _sort_labels(axes: dict[str, dict]) -> list[dict]:
         items = sorted(axes.values(), key=lambda a: a["pdf_pos"])
@@ -284,6 +304,7 @@ def extract_grids_from_pdf(
         # small subsets, but the merged labels must also be globally valid.
         pairs = [(a["label"], a["pdf_pos"]) for a in items]
         if not _is_valid_grid_axis(pairs):
+            _log.debug("grid_extractor: merged axis rejected — labels=%s", [l for l, _ in pairs])
             return []
         base = items[0]["real_mm"]
         for a in items:

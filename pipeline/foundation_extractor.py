@@ -24,8 +24,14 @@ PT_TO_MM = 25.4 / 72.0
 
 # Pile / footing type labels
 _PILE_MARK_RE    = re.compile(r'^P(\d+[A-Za-z]?)$',  re.IGNORECASE)   # P1, P2a
+# Narrow: require explicit prefix before digits; reject bare single letters followed by
+# numbers in dimension context (e.g. F400 in "F'c=400", M24 bolts, P800 pressure).
+# Negative lookbehind: not after =, ×, x (dimension context)
+# Negative lookahead: not before kN, MPa, mm, kg (force/unit context)
 _FOOTING_TYPE_RE = re.compile(
-    r'\b(?:PF|PC|MC|M[DĐ]|MB|SF|RF|CB|F|P|M)(\d+[A-Za-z]?)\b',
+    r'(?<![=×xX\d])'
+    r'\b(?:PF|PC|MC|M[DĐ]|MB|SF|RF|CB|F|P|M)(\d+[A-Za-z]?)\b'
+    r'(?!\s*(?:kN|MPa|mm|kg|m\b))',
     re.IGNORECASE,
 )
 
@@ -47,8 +53,9 @@ _GBEAM_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Drawing-area margin: annotations this many pts past rightmost grid are in the schedule
-_DRAWING_X_MARGIN_PTS = 120
+# Drawing-area margin base (pts past rightmost grid line → schedule territory).
+# Actual margin is computed dynamically as max(60, 8% of grid span).
+_DRAWING_X_MARGIN_BASE_PTS = 60
 
 
 # ── Text utilities ─────────────────────────────────────────────────────────────
@@ -75,11 +82,11 @@ def _all_text(page: fitz.Page) -> list[tuple[str, float, float, float]]:
 def _group_rows(
     spans: list[tuple[str, float, float, float]],
     tolerance: float = 4.0,
-) -> dict[int, list[tuple[str, float]]]:
+) -> dict[float, list[tuple[str, float]]]:
     """Group text spans into horizontal rows (same Y ± tolerance)."""
-    rows: dict[int, list[tuple[str, float]]] = {}
+    rows: dict[float, list[tuple[str, float]]] = {}
     for t, x, y, _ in spans:
-        key = int(round(y / tolerance)) * int(tolerance)
+        key = round(y / tolerance) * tolerance   # symmetric rounding; was int()*int() which broke on floats
         rows.setdefault(key, []).append((t, x))
     return rows
 
@@ -296,7 +303,7 @@ def _is_plain_number(s: str) -> bool:
 def find_all_pile_annotations(
     page: fitz.Page,
     grid: dict,
-    snap_radius_mm: float = 2000.0,
+    snap_radius_mm: float = 600.0,
 ) -> tuple[dict[str, str], list[dict]]:
     """Find ALL pile / footing annotations on the drawing (including off-grid).
 
@@ -311,10 +318,14 @@ def find_all_pile_annotations(
     spans = _all_text(page)
     page_w = page.rect.width
 
-    # X threshold: annotations farther right than this are in the schedule/title block
-    x_max_drawing = (
-        x_axes[-1]["pdf_pos"] + _DRAWING_X_MARGIN_PTS if x_axes else page_w * 0.62
-    )
+    # X threshold: annotations farther right than this are in the schedule/title block.
+    # Dynamic margin: 8% of grid span, minimum 60pts.
+    if x_axes:
+        grid_span_pts = x_axes[-1]["pdf_pos"] - x_axes[0]["pdf_pos"]
+        margin = max(_DRAWING_X_MARGIN_BASE_PTS, grid_span_pts * 0.08)
+        x_max_drawing = x_axes[-1]["pdf_pos"] + margin
+    else:
+        x_max_drawing = page_w * 0.62
 
     # Grid origin in PDF pts (zero-based reference)
     gx0 = x_axes[0]["pdf_pos"] if x_axes else 0.0
@@ -691,25 +702,30 @@ def extract_foundations(page: fitz.Page, grid: dict, global_schedule: dict | Non
         })
 
     # ── Fallback: no annotations found → generate from grid ────────────────────
+    # Only auto-fill ALL grid intersections when schedule has ≥3 entries
+    # (meaning it is a real schedule, not noise). With fewer entries the
+    # grid-fill produces massive false-positive counts; signal the caller
+    # to try Vision AI instead.
     if not footings and x_axes and y_axes and (schedule or pile_spec):
-        default = _default_spec(has_piles, pile_spec)
-        for ya in y_axes:
-            for xa in x_axes:
-                footings.append({
-                    "id":          f"FDN-{ya['label']}{xa['label']}",
-                    "grid_ref":    f"{ya['label']}/{xa['label']}",
-                    "x_mm":        xa["real_mm"],
-                    "y_mm":        ya["real_mm"],
-                    "label":       "AUTO",
-                    "ftype":       default["ftype"],
-                    "width_mm":    default["width_mm"],
-                    "depth_mm":    default["depth_mm"],
-                    "height_mm":   default["height_mm"],
-                    "pile_dia_mm": default.get("pile_dia_mm", 0),
-                    "pile_len_mm": default.get("pile_len_mm", 0),
-                    "pile_count":  default.get("pile_count", 1),
-                    "material":    "concrete",
-                })
+        if len(schedule) >= 3:
+            default = _default_spec(has_piles, pile_spec)
+            for ya in y_axes:
+                for xa in x_axes:
+                    footings.append({
+                        "id":          f"FDN-{ya['label']}{xa['label']}",
+                        "grid_ref":    f"{ya['label']}/{xa['label']}",
+                        "x_mm":        xa["real_mm"],
+                        "y_mm":        ya["real_mm"],
+                        "label":       "AUTO",
+                        "ftype":       default["ftype"],
+                        "width_mm":    default["width_mm"],
+                        "depth_mm":    default["depth_mm"],
+                        "height_mm":   default["height_mm"],
+                        "pile_dia_mm": default.get("pile_dia_mm", 0),
+                        "pile_len_mm": default.get("pile_len_mm", 0),
+                        "pile_count":  default.get("pile_count", 1),
+                        "material":    "concrete",
+                    })
 
     # ── Lift pits ───────────────────────────────────────────────────────────────
     lift_pits = _detect_lift_pits(page, grid, pt_mm)
@@ -749,26 +765,52 @@ def _detect_lift_pits(page: fitz.Page, grid: dict, pt_mm: float) -> list[dict]:
     text = page.get_text()
     x_axes = grid.get("x_axes", [])
     y_axes = grid.get("y_axes", [])
+    spans  = _all_text(page)
+
+    # Build a coord lookup: label string → (x_pdf, y_pdf)
+    label_coords: dict[str, tuple[float, float]] = {}
+    for t, x, y, _ in spans:
+        lm = _LIFT_PIT_LABEL_RE.match(t.strip())
+        if lm:
+            key = f"LP{lm.group(1)}"
+            label_coords.setdefault(key, (x, y))
 
     pits: list[dict] = []
 
     for m in _LIFT_PIT_RE.finditer(text):
         depth_mm = int(m.group(1))
         if depth_mm < 500 or depth_mm > 3000:
-            continue   # sanity check
+            continue
 
-        # Lift pits are typically 1200×1200mm to 2400×2400mm
+        pit_id = f"LP-{len(pits)+1:02d}"
+
+        # Try to find real position from label span coordinates
+        lbl_key = f"LP{len(pits)+1}"
+        if lbl_key in label_coords:
+            px, py = label_coords[lbl_key]
+            gx0 = x_axes[0]["pdf_pos"] if x_axes else 0.0
+            gy0 = y_axes[0]["pdf_pos"] if y_axes else 0.0
+            rx = (px - gx0) * pt_mm
+            ry = (py - gy0) * pt_mm
+            nearest_ref, dist = _nearest_grid_intersection(rx, ry, x_axes, y_axes)
+            grid_ref = nearest_ref if (nearest_ref and dist < 1500) else "off_grid"
+            x_mm, y_mm = round(rx), round(ry)
+            needs_review = False
+        else:
+            grid_ref, x_mm, y_mm, needs_review = "off_grid", 0.0, 0.0, True
+
         pits.append({
-            "id":        f"LP-{len(pits)+1:02d}",
-            "ftype":     "lift_pit",
-            "depth_mm":  depth_mm,
-            "width_mm":  1500,   # typical; actual from drawings would be better
-            "height_mm": depth_mm,
-            "material":  "concrete",
-            "grid_ref":  "off_grid",
-            "x_mm":      0.0,
-            "y_mm":      0.0,
-            "note":      "Lift pit — verify position from drawing",
+            "id":           pit_id,
+            "ftype":        "lift_pit",
+            "depth_mm":     depth_mm,
+            "width_mm":     1500,
+            "height_mm":    depth_mm,
+            "material":     "concrete",
+            "grid_ref":     grid_ref,
+            "x_mm":         x_mm,
+            "y_mm":         y_mm,
+            "needs_review": needs_review,
+            "note":         "Lift pit — verify position from drawing",
         })
 
     return pits

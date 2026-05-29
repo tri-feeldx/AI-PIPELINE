@@ -14,14 +14,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
+import time
 
 import fitz
 
 logger = logging.getLogger(__name__)
 
-_DPI = 150          # page render DPI — 150 is good balance of quality vs token cost
-_MAX_RETRIES = 2    # retry once on JSON parse error
+_DPI = 150   # full-page render DPI
+_TILE_DPI = 200  # higher DPI for tiles (smaller area, more detail per px)
 
 # ── Lazy Gemini client ─────────────────────────────────────────────────────────
 
@@ -66,6 +68,60 @@ def _call_gemini(image_bytes: bytes, prompt: str) -> str:
         ),
     )
     return response.text
+
+
+def _call_gemini_with_retry(image_bytes: bytes, prompt: str, max_retries: int = 3) -> str | None:
+    """Call Gemini with exponential backoff on 429 rate-limit errors."""
+    delays = [8, 20, 60]   # seconds to wait before each retry
+    for attempt in range(max_retries):
+        try:
+            return _call_gemini(image_bytes, prompt)
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                if attempt < max_retries - 1:
+                    sleep_s = delays[attempt] + random.uniform(0, 4)
+                    logger.warning(
+                        "Vision AI 429 rate limit — retry %d/%d in %.0fs",
+                        attempt + 1, max_retries - 1, sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                else:
+                    logger.error("Vision AI quota exhausted after %d retries", max_retries)
+                    return None
+            else:
+                raise
+    return None
+
+
+def _page_to_tiles(
+    page: fitz.Page,
+    dpi: int = _TILE_DPI,
+    cols: int = 2,
+    rows: int = 2,
+    overlap: float = 0.10,
+):
+    """Yield (png_bytes, x0_frac, y0_frac, w_frac, h_frac) for each tile.
+
+    Splits the page into a cols×rows grid with `overlap` fraction of overlap
+    on each side so annotations near tile borders are fully visible in at
+    least one tile. Coordinates are fractions of the full page dimensions.
+    """
+    pw = page.rect.width
+    ph = page.rect.height
+    tile_w = 1.0 / cols + overlap
+    tile_h = 1.0 / rows + overlap
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+
+    for r in range(rows):
+        for c in range(cols):
+            x0 = max(0.0, c / cols - overlap / 2)
+            y0 = max(0.0, r / rows - overlap / 2)
+            x1 = min(1.0, x0 + tile_w)
+            y1 = min(1.0, y0 + tile_h)
+            clip = fitz.Rect(x0 * pw, y0 * ph, x1 * pw, y1 * ph)
+            pix = page.get_pixmap(matrix=mat, clip=clip)
+            yield pix.tobytes("png"), x0, y0, (x1 - x0), (y1 - y0)
 
 
 def _parse_json(text: str) -> dict | list | None:
@@ -115,19 +171,16 @@ scale = denominator only (e.g. 100 for 1:100, 80 for 1:80)
 If scale not found, use 100."""
 
     png = _page_to_png(page)
-    for attempt in range(_MAX_RETRIES):
-        try:
-            raw = _call_gemini(png, prompt)
-            data = _parse_json(raw)
-            if not isinstance(data, dict):
-                continue
-            if not data.get("x_axes") and not data.get("y_axes"):
-                logger.warning("extract_grid_vision: empty axes returned (attempt %d)", attempt)
-                continue
-            return data
-        except Exception as e:
-            logger.warning("extract_grid_vision attempt %d failed: %s", attempt, e)
-    return None
+    raw = _call_gemini_with_retry(png, prompt)
+    if raw is None:
+        return None
+    data = _parse_json(raw)
+    if not isinstance(data, dict):
+        return None
+    if not data.get("x_axes") and not data.get("y_axes"):
+        logger.warning("extract_grid_vision: empty axes returned")
+        return None
+    return data
 
 
 def extract_schedule_vision(page: fitz.Page) -> list[dict] | None:
@@ -173,15 +226,11 @@ Rules:
 - Use 0 for any value not found in the table"""
 
     png = _page_to_png(page)
-    for attempt in range(_MAX_RETRIES):
-        try:
-            raw = _call_gemini(png, prompt)
-            data = _parse_json(raw)
-            if isinstance(data, list):
-                return data
-        except Exception as e:
-            logger.warning("extract_schedule_vision attempt %d failed: %s", attempt, e)
-    return None
+    raw = _call_gemini_with_retry(png, prompt)
+    if raw is None:
+        return None
+    data = _parse_json(raw)
+    return data if isinstance(data, list) else None
 
 
 def extract_foundations_vision(
@@ -251,16 +300,36 @@ Return ONLY valid JSON array, no explanation:
 
 confidence: "high" = clearly on grid, "medium" = estimated, "low" = uncertain"""
 
-    png = _page_to_png(page)
-    for attempt in range(_MAX_RETRIES):
-        try:
-            raw = _call_gemini(png, prompt)
-            data = _parse_json(raw)
-            if isinstance(data, list):
-                return _convert_vision_fdns_to_model(data, grid, schedule, page)
-        except Exception as e:
-            logger.warning("extract_foundations_vision attempt %d failed: %s", attempt, e)
-    return None
+    # Use 2×2 tiled images for better resolution on large A0/A1 drawings.
+    # Each tile is sent at higher DPI; results are merged and deduplicated.
+    all_raw: list[dict] = []
+    seen_grid_refs: set[str] = set()
+
+    for tile_png, tx0, ty0, tw, th in _page_to_tiles(page):
+        raw = _call_gemini_with_retry(tile_png, prompt)
+        if raw is None:
+            logger.warning("extract_foundations_vision: tile (%.2f,%.2f) got no response", tx0, ty0)
+            continue
+        data = _parse_json(raw)
+        if not isinstance(data, list):
+            continue
+
+        # Re-map tile-local x_percent/y_percent back to full-page fractions
+        for item in data:
+            item["x_percent"] = tx0 + float(item.get("x_percent", 0.5)) * tw
+            item["y_percent"] = ty0 + float(item.get("y_percent", 0.5)) * th
+
+            # Deduplicate by grid_ref (same intersection found in overlapping tiles)
+            gref = item.get("grid_ref", "off_grid")
+            if gref != "off_grid" and gref in seen_grid_refs:
+                continue
+            if gref != "off_grid":
+                seen_grid_refs.add(gref)
+            all_raw.append(item)
+
+    if not all_raw:
+        return None
+    return _convert_vision_fdns_to_model(all_raw, grid, schedule, page)
 
 
 def _convert_vision_fdns_to_model(

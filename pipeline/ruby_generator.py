@@ -128,6 +128,7 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
     lines += [
         "# Axis-aligned box: origin corner (x,y,z), dimensions (w,d,h)",
         "def ap_box(ents, x, y, z, w, d, h, lyr, mat)",
+        "  return nil if w.abs < 1e-6 || d.abs < 1e-6 || h.abs < 1e-6",
         "  g = ents.add_group; g.layer = lyr",
         "  f = g.entities.add_face(",
         "    [x,y,z],[x+w,y,z],[x+w,y+d,z],[x,y+d,z])",
@@ -140,6 +141,7 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         "def ap_beam(ents, x1,y1,z1, x2,y2,z2, bw,bh, lyr, mat)",
         "  dx=x2-x1; dy=y2-y1",
         "  len=Math.sqrt(dx*dx+dy*dy); return if len<1e-6",
+        "  return if bw.abs < 1e-6 || bh.abs < 1e-6",
         "  ang=Math.atan2(dy,dx)",
         "  g=ents.add_group; g.layer=lyr",
         "  ge=g.entities",
@@ -155,6 +157,7 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         "",
         "# Circular cylinder: centre (cx,cy), bottom at z_bot, extruding upward by height",
         "def ap_cylinder(ents, cx,cy,z_bot, radius, height, lyr, mat)",
+        "  return nil if radius < 1e-6 || height.abs < 1e-6",
         "  g=ents.add_group; g.layer=lyr",
         "  ge=g.entities",
         "  n=16",
@@ -188,6 +191,17 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         pile_count = f.get("pile_count",  1)
         gref       = f.get("grid_ref", "")
         fid        = f.get("id", "")
+
+        # Guard: use sensible fallbacks if dimensions are zero (failed extraction)
+        if cap_w < 1e-6:
+            cap_w = _in(1500)
+            warnings.append(f"{fid}: width_mm=0, defaulted to 1500mm")
+        if cap_d < 1e-6:
+            cap_d = _in(1500)
+            warnings.append(f"{fid}: depth_mm=0, defaulted to 1500mm")
+        if cap_h < 1e-6:
+            cap_h = _in(700)
+            warnings.append(f"{fid}: height_mm=0, defaulted to 700mm")
 
         # Z: top of cap/footing = ground level - setdown
         z_cap_top = z_ground - _in(CAP_SETDOWN_MM)
@@ -321,6 +335,8 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
             h = _in(18000)
             warnings.append(f"{col.get('id','?')}: zero height, defaulted 18m")
 
+        if w < 1e-6: w = _in(150)
+        if d < 1e-6: d = _in(150)
         mat = "mat_steel" if col.get("material", "steel") == "steel" else "mat_conc"
         lines.append(
             f"ap_box(ents, {x-w/2:.6f},{y-d/2:.6f},{z_b:.6f},"
@@ -346,6 +362,8 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
             skipped.append(f"{beam.get('id','?')}: zero span")
             continue
 
+        if bw < 1e-6: bw = _in(100)
+        if bh < 1e-6: bh = _in(200)
         mat = "mat_steel" if beam.get("material", "steel") == "steel" else "mat_conc"
         lines.append(
             f"ap_beam(ents, {x1:.6f},{y1:.6f},{z:.6f},{x2:.6f},{y2:.6f},{z:.6f},"

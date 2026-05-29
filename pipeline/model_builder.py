@@ -20,6 +20,7 @@ from pipeline.grid_extractor import extract_grids_from_pdf, extract_grid, PT_TO_
 from pipeline.element_detector import detect_elements
 from pipeline.level_extractor import extract_levels_from_pdf
 from pipeline.foundation_extractor import extract_foundations
+from pipeline.quality_gate import assess_quality
 
 
 # ── Section dimension lookup (built-in common Australian sections) ─────────────
@@ -123,10 +124,17 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             # Keep the result with the MOST footings (Footing Plan at 1:100
             # beats Footing Details at 1:20 which appears first in page order).
             if page_type == "foundation_plan":
-                fdn_result = extract_foundations(
-                    page, page_grid if page_grid["x_axes"] else grid
-                )
+                active_grid = page_grid if page_grid["x_axes"] else grid
+                fdn_result = extract_foundations(page, active_grid)
+
+                # Quality gate — try Vision AI if vector result is poor
                 if fdn_result.get("has_foundation_plan"):
+                    quality = assess_quality(fdn_result, active_grid, classifications)
+                    if quality.needs_vision:
+                        fdn_result = _vision_fallback(
+                            page, active_grid, fdn_result, quality
+                        )
+
                     if len(fdn_result.get("footings", [])) > len(
                         foundation_extraction.get("footings", [])
                     ):
@@ -177,6 +185,11 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     # Priority: use data extracted directly from a foundation_plan page.
     # Fall back to auto-generating at every grid intersection only when
     # no foundation_plan page was found in the PDF.
+    ai_used = {
+        "grid":        foundation_extraction.get("_vision_grid", False),
+        "schedule":    foundation_extraction.get("_vision_schedule", False),
+        "foundations": foundation_extraction.get("_vision_foundations", False),
+    }
     if foundation_extraction.get("footings"):
         foundations   = foundation_extraction["footings"]
         ground_beams  = foundation_extraction.get("ground_beams", [])
@@ -275,6 +288,7 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         "rafts":                rafts,
         "foundation_schedule":  foundation_extraction.get("schedule", {}),
         "foundation_pile_spec": foundation_extraction.get("pile_spec", {}),
+        "ai_used": ai_used,
         "summary_counts": {
             "columns":      len(cols_final),
             "beams":        len(beams_final),
@@ -291,6 +305,141 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         progress_cb("model", 1.0)
 
     return unified
+
+
+def _vision_fallback(
+    page: fitz.Page,
+    grid: dict,
+    fdn_result: dict,
+    quality,
+) -> dict:
+    """Run targeted Vision AI calls to fill specific extraction gaps.
+
+    Only imports vision_extractor when actually needed (keeps startup fast
+    and avoids Vertex AI auth errors when AI is not configured).
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    try:
+        from pipeline.vision_extractor import (
+            extract_grid_vision,
+            extract_schedule_vision,
+            extract_foundations_vision,
+        )
+    except ImportError as e:
+        log.warning("vision_extractor import failed (%s) — skipping AI fallback", e)
+        return fdn_result
+
+    improved = dict(fdn_result)
+    failed = quality.failed_checks
+
+    # Fix grid first (other fixes depend on it)
+    if "grid" in failed:
+        log.info("Vision fallback: extracting grid from image")
+        vision_grid = extract_grid_vision(page)
+        if vision_grid:
+            grid = _apply_vision_grid(vision_grid, page, grid)
+            improved["_vision_grid"] = True
+
+    # Fix schedule (dims=0 or schedule check failed)
+    if "schedule" in failed or "dims" in failed:
+        log.info("Vision fallback: extracting schedule from image")
+        vision_sched = extract_schedule_vision(page)
+        if vision_sched:
+            improved["schedule"] = _merge_schedules(
+                improved.get("schedule", {}), vision_sched
+            )
+            improved["_vision_schedule"] = True
+
+    # Fix foundation positions (missing, bad coords, or bad coverage)
+    if any(c in failed for c in ("foundations", "coords", "coverage")):
+        log.info("Vision fallback: extracting foundation positions from image")
+        vision_fdns = extract_foundations_vision(
+            page, grid, improved.get("schedule", {})
+        )
+        if vision_fdns:
+            existing = improved.get("footings", [])
+            # Prefer vision results if they're more complete
+            if len(vision_fdns) >= len(existing):
+                improved["footings"] = vision_fdns
+            else:
+                improved["footings"] = existing + [
+                    f for f in vision_fdns
+                    if f["grid_ref"] not in {e.get("grid_ref") for e in existing}
+                ]
+            improved["_vision_foundations"] = True
+
+    return improved
+
+
+def _apply_vision_grid(vision_grid: dict, page: fitz.Page, fallback_grid: dict) -> dict:
+    """Convert Gemini grid (x_percent/y_percent) to real_mm coords."""
+    from pipeline.grid_extractor import PT_TO_MM
+
+    pw = page.rect.width
+    ph = page.rect.height
+    scale = vision_grid.get("scale", fallback_grid.get("scale", 100))
+    pt_to_mm = PT_TO_MM * scale
+
+    def _build_axes(items, dim, coord_key):
+        sorted_items = sorted(items, key=lambda a: a.get(coord_key, 0))
+        base_pdf = sorted_items[0].get(coord_key, 0) * dim if sorted_items else 0.0
+        axes = []
+        for a in sorted_items:
+            pdf_pos = a.get(coord_key, 0) * dim
+            axes.append({
+                "label":   str(a.get("label", "?")),
+                "pdf_pos": round(pdf_pos, 2),
+                "real_mm": round((pdf_pos - base_pdf) * pt_to_mm, 1),
+            })
+        return axes
+
+    x_axes = _build_axes(vision_grid.get("x_axes", []), pw, "x_percent")
+    y_axes = _build_axes(vision_grid.get("y_axes", []), ph, "y_percent")
+
+    return {
+        **fallback_grid,
+        "x_axes":   x_axes or fallback_grid.get("x_axes", []),
+        "y_axes":   y_axes or fallback_grid.get("y_axes", []),
+        "scale":    scale,
+        "pt_to_mm": round(pt_to_mm, 4),
+        "source":   "vision_ai",
+    }
+
+
+def _merge_schedules(vector_sched: dict, vision_list: list[dict]) -> dict:
+    """Merge vector schedule with vision AI schedule, preferring vision for zero-dim entries."""
+    merged = dict(vector_sched)
+    for entry in vision_list:
+        mark = str(entry.get("mark", "")).upper()
+        if not mark:
+            continue
+        existing = merged.get(mark, {})
+        # Use vision data if existing dims are zero
+        if existing.get("width_mm", 0) == 0 and existing.get("pile_dia_mm", 0) == 0:
+            merged[mark] = {
+                "ftype":        entry.get("ftype", "pile_cap"),
+                "pile_dia_mm":  entry.get("pile_dia_mm", 0),
+                "pile_len_mm":  entry.get("socket_m", 0) * 1000,
+                "pile_count":   entry.get("pile_count", 1),
+                "width_mm":     entry.get("width_mm", 0),
+                "depth_mm":     entry.get("depth_mm", 0),
+                "height_mm":    entry.get("height_mm", 0),
+                "source":       "vision_ai",
+            }
+        elif not existing:
+            merged[mark] = {
+                "ftype":        entry.get("ftype", "pile_cap"),
+                "pile_dia_mm":  entry.get("pile_dia_mm", 0),
+                "pile_len_mm":  entry.get("socket_m", 0) * 1000,
+                "pile_count":   entry.get("pile_count", 1),
+                "width_mm":     entry.get("width_mm", 0),
+                "depth_mm":     entry.get("depth_mm", 0),
+                "height_mm":    entry.get("height_mm", 0),
+                "source":       "vision_ai",
+            }
+    return merged
 
 
 def _detect_dominant_scale(classifications: list[dict]) -> int:

@@ -169,6 +169,9 @@ with col_left:
 
 with col_right:
     with st.expander("📄  stage4_unified_model.json"):
+        ai = unified.get("ai_used", {})
+        if any(ai.values()):
+            st.info("🤖 Vision AI used: " + ", ".join(k for k, v in ai.items() if v))
         c = unified["summary_counts"]
         g = unified["grid_system"]
         st.json({

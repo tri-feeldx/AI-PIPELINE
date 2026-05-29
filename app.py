@@ -147,7 +147,7 @@ with col_left:
             st.json({
                 "type_summary": cls_data.get("type_summary", {}),
                 "pages": [{"page": p["page_num"], "type": p["drawing_type"],
-                           "scale": p.get("scale_ratio"), "title": p.get("drawing_title", "")[:40]}
+                           "scale": p.get("scale_ratio"), "title": (p.get("drawing_title") or "")[:40]}
                           for p in cls_data.get("pages", [])],
             })
 

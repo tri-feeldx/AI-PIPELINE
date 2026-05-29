@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "npx",
+      "args": ["@colbymchenry/codegraph", "serve", "--mcp"]
+    }
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx @colbymchenry/codegraph sync",
+            "async": true,
+            "statusMessage": "Syncing CodeGraph index..."
+          }
+        ]
+      }
+    ]
+  }
+}

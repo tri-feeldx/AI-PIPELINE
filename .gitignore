@@ -2,6 +2,7 @@
 .env
 *.json
 !.env.example
+!.claude/settings.json
 
 # Runtime data (job outputs, uploaded PDFs, page images)
 data/
@@ -19,3 +20,8 @@ probe*.py
 # Misc
 *.zip
 gop_y.txt
+lỗi.txt
+yeucau.txt
+
+# CodeGraph — generated locally per machine, not committed
+.codegraph/codegraph.db

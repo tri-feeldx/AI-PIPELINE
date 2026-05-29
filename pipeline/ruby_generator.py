@@ -15,6 +15,22 @@ from pathlib import Path
 MM_TO_IN = 0.0393701  # 1 mm in SketchUp inches
 
 
+def _bim_attrs(var: str, attrs: dict) -> list[str]:
+    """Return Ruby lines that set BIM attributes on a SketchUp group variable."""
+    if not attrs:
+        return []
+    lines = [f"if {var}"]
+    for k, v in attrs.items():
+        if isinstance(v, str):
+            lines.append(f"  {var}.set_attribute('BIM','{k}',{repr(v)})")
+        elif isinstance(v, bool):
+            lines.append(f"  {var}.set_attribute('BIM','{k}',{'true' if v else 'false'})")
+        else:
+            lines.append(f"  {var}.set_attribute('BIM','{k}',{v})")
+    lines.append("end")
+    return lines
+
+
 def _in(mm) -> float:
     try:
         return round(float(mm) * MM_TO_IN, 6)
@@ -83,8 +99,10 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
     bottom_lv = levels[0]  if levels else {"name": "GROUND FLOOR", "elevation_mm": 0}
     top_lv    = levels[-1] if levels else {"name": "ROOF",         "elevation_mm": 18000}
 
-    ground_beams = model.get("ground_beams", [])
-    rafts        = model.get("rafts", [])
+    ground_beams  = model.get("ground_beams", [])
+    rafts         = model.get("rafts", [])
+    lift_pits     = model.get("lift_pits", [])
+    has_planter   = model.get("has_planter_slab", False)
 
     # ── Header ────────────────────────────────────────────────────────────────
     lines += [
@@ -105,22 +123,28 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
 
     # ── Layers ────────────────────────────────────────────────────────────────
     lines += [
-        "lyr_found  = model.layers.add('Foundations')",
-        "lyr_pile   = model.layers.add('Piles')",
-        "lyr_gbeam  = model.layers.add('GroundBeams')",
-        "lyr_raft   = model.layers.add('Rafts')",
-        "lyr_col    = model.layers.add('Columns')",
-        "lyr_beam   = model.layers.add('Beams')",
-        "lyr_slab   = model.layers.add('Slabs')",
+        "lyr_found    = model.layers.add('Foundations')",
+        "lyr_pit      = model.layers.add('LiftPits')",
+        "lyr_pile     = model.layers.add('Piles')",
+        "lyr_gbeam    = model.layers.add('GroundBeams')",
+        "lyr_raft     = model.layers.add('Rafts')",
+        "lyr_col      = model.layers.add('Columns')",
+        "lyr_beam     = model.layers.add('Beams-RC')",
+        "lyr_beam_pt  = model.layers.add('Beams-PT')",
+        "lyr_slab     = model.layers.add('Slabs-RC')",
+        "lyr_slab_pt  = model.layers.add('Slabs-PT')",
         "",
     ]
 
     # ── Materials ─────────────────────────────────────────────────────────────
     lines += [
-        "mat_conc  = model.materials.add('Concrete');  mat_conc.color  = Sketchup::Color.new(190,185,175)",
-        "mat_pile  = model.materials.add('Pile');      mat_pile.color  = Sketchup::Color.new(160,155,145)",
-        "mat_steel = model.materials.add('Steel');     mat_steel.color = Sketchup::Color.new(90,130,175)",
-        "mat_slab  = model.materials.add('Slab');      mat_slab.color  = Sketchup::Color.new(215,205,190)",
+        "mat_conc  = model.materials.add('Concrete-RC');  mat_conc.color  = Sketchup::Color.new(190,185,175)",
+        "mat_pt    = model.materials.add('Concrete-PT');  mat_pt.color    = Sketchup::Color.new(100,160,220)",
+        "mat_pile  = model.materials.add('Pile');         mat_pile.color  = Sketchup::Color.new(160,155,145)",
+        "mat_steel = model.materials.add('Steel');        mat_steel.color = Sketchup::Color.new(90,130,175)",
+        "mat_slab  = model.materials.add('Slab-RC');      mat_slab.color  = Sketchup::Color.new(215,205,190)",
+        "mat_slab_pt = model.materials.add('Slab-PT');    mat_slab_pt.color = Sketchup::Color.new(160,200,240)",
+        "mat_pit     = model.materials.add('LiftPit');    mat_pit.color     = Sketchup::Color.new(80,80,80)",
         "",
     ]
 
@@ -219,13 +243,24 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         z_cap_top = z_ground - _in(CAP_SETDOWN_MM)
         z_cap_bot = z_cap_top - cap_h
 
+        fc_fdn = f.get("fc_mpa", 50)
+        fdn_label = f.get("label", fid)
+
         if ftype in ("pile_cap", "pile"):
             # Pile cap box
             lines.append(
-                f"ap_box(ents, {x_c-cap_w/2:.6f},{y_c-cap_d/2:.6f},{z_cap_bot:.6f},"
+                f"_g = ap_box(ents, {x_c-cap_w/2:.6f},{y_c-cap_d/2:.6f},{z_cap_bot:.6f},"
                 f"{cap_w:.6f},{cap_d:.6f},{cap_h:.6f},lyr_found,mat_conc)"
                 f"  # {fid} cap @ {gref}"
             )
+            lines += _bim_attrs("_g", {
+                "element_type": "PileCap",
+                "mark": fdn_label,
+                "fc_mpa": fc_fdn,
+                "width_mm": round(cap_w / MM_TO_IN),
+                "depth_mm": round(cap_d / MM_TO_IN),
+                "height_mm": round(cap_h / MM_TO_IN),
+            })
             counts["foundations"] += 1
 
             # Piles below cap
@@ -333,6 +368,34 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         )
     lines.append("")
 
+    # ── Lift pits ──────────────────────────────────────────────────────────────
+    lines += ["# ===== LIFT PITS ====="]
+    z_pit_ref = z_ground - _in(CAP_SETDOWN_MM)  # top of pit = foundation level
+    for lp in lift_pits:
+        lp_x = _in(lp.get("x_mm", 0))
+        lp_y = _in(lp.get("y_mm", 0))
+        lp_w = _in(lp.get("width_mm", 1500))
+        lp_d = _in(lp.get("width_mm", 1500))   # typically square
+        lp_h = _in(lp.get("depth_mm", 1200))
+        if lp_w < 1e-6 or lp_h < 1e-6:
+            continue
+        z_pit_bot = z_pit_ref - lp_h
+        lid = lp.get("id", "")
+        lines.append(
+            f"_g = ap_box(ents, {lp_x-lp_w/2:.6f},{lp_y-lp_d/2:.6f},{z_pit_bot:.6f},"
+            f"{lp_w:.6f},{lp_d:.6f},{lp_h:.6f},lyr_pit,mat_pit)"
+            f"  # {lid} lift pit"
+        )
+        lines += _bim_attrs("_g", {
+            "element_type": "LiftPit",
+            "mark": lid,
+            "depth_mm": lp.get("depth_mm", 1200),
+            "note": lp.get("note", ""),
+        })
+    if has_planter:
+        lines.append("# NOTE: Planter/landscape slabs detected (min 300mm thick) — verify slab thickness")
+    lines.append("")
+
     # ── Columns ───────────────────────────────────────────────────────────────
     lines += ["# ===== COLUMNS ====="]
     for col in columns:
@@ -350,11 +413,20 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         if w < 1e-6: w = _in(150)
         if d < 1e-6: d = _in(150)
         mat = "mat_steel" if col.get("material", "steel") == "steel" else "mat_conc"
+        cid = col.get('id', '')
         lines.append(
-            f"ap_box(ents, {x-w/2:.6f},{y-d/2:.6f},{z_b:.6f},"
+            f"_g = ap_box(ents, {x-w/2:.6f},{y-d/2:.6f},{z_b:.6f},"
             f"{w:.6f},{d:.6f},{h:.6f},lyr_col,{mat})"
-            f"  # {col.get('id','')} @ {col.get('grid_ref','')}"
+            f"  # {cid} @ {col.get('grid_ref','')}"
         )
+        lines += _bim_attrs("_g", {
+            "element_type": "Column",
+            "mark": col.get("column_mark", cid),
+            "fc_mpa": col.get("fc_mpa", 50),
+            "material": col.get("material", "steel"),
+            "width_mm": round(w / MM_TO_IN),
+            "depth_mm": round(d / MM_TO_IN),
+        })
         counts["columns"] += 1
     lines.append("")
 
@@ -376,12 +448,25 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
 
         if bw < 1e-6: bw = _in(100)
         if bh < 1e-6: bh = _in(200)
-        mat = "mat_steel" if beam.get("material", "steel") == "steel" else "mat_conc"
+        is_pt   = beam.get("is_pt", False)
+        fc_mpa  = beam.get("fc_mpa", 40)
+        mat_var = "mat_pt" if is_pt else ("mat_steel" if beam.get("material", "steel") == "steel" else "mat_conc")
+        lyr_var = "lyr_beam_pt" if is_pt else "lyr_beam"
+        bid = beam.get('id', '')
         lines.append(
-            f"ap_beam(ents, {x1:.6f},{y1:.6f},{z:.6f},{x2:.6f},{y2:.6f},{z:.6f},"
-            f"{bw:.6f},{bh:.6f},lyr_beam,{mat})"
-            f"  # {beam.get('id','')} {beam.get('section_label','')} @ {beam.get('grid_ref','')}"
+            f"_g = ap_beam(ents, {x1:.6f},{y1:.6f},{z:.6f},{x2:.6f},{y2:.6f},{z:.6f},"
+            f"{bw:.6f},{bh:.6f},{lyr_var},{mat_var})"
+            f"  # {bid} {beam.get('section_label','')} @ {beam.get('grid_ref','')}"
         )
+        lines += _bim_attrs("_g", {
+            "element_type": "Beam",
+            "mark": bid,
+            "is_pt": is_pt,
+            "fc_mpa": fc_mpa,
+            "material": beam.get("material", "steel"),
+            "width_mm": round(bw / MM_TO_IN),
+            "depth_mm": round(bh / MM_TO_IN),
+        })
         counts["beams"] += 1
     lines.append("")
 
@@ -401,11 +486,23 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
             skipped.append(f"{slab.get('id','?')}: zero area")
             continue
 
+        is_pt_slab = slab.get("is_pt", False)
+        fc_slab    = slab.get("fc_mpa", 40)
+        mat_slab_var = "mat_slab_pt" if is_pt_slab else "mat_slab"
+        lyr_slab_var = "lyr_slab_pt" if is_pt_slab else "lyr_slab"
+        sid = slab.get('id', '')
         lines.append(
-            f"ap_box(ents, {min(x1,x2):.6f},{min(y1,y2):.6f},{z:.6f},"
-            f"{sw:.6f},{sd:.6f},{t:.6f},lyr_slab,mat_slab)"
-            f"  # {slab.get('id','')} @ {slab.get('grid_ref','')}"
+            f"_g = ap_box(ents, {min(x1,x2):.6f},{min(y1,y2):.6f},{z:.6f},"
+            f"{sw:.6f},{sd:.6f},{t:.6f},{lyr_slab_var},{mat_slab_var})"
+            f"  # {sid} @ {slab.get('grid_ref','')}"
         )
+        lines += _bim_attrs("_g", {
+            "element_type": "Slab",
+            "mark": sid,
+            "is_pt": is_pt_slab,
+            "fc_mpa": fc_slab,
+            "thickness_mm": round(t / MM_TO_IN),
+        })
         counts["slabs"] += 1
     lines.append("")
 
@@ -428,7 +525,7 @@ def generate_ruby(model: dict, job_dir: str) -> dict:
         "stage": 5,
         "stage_name": "Ruby Generator",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "elements_generated": {**counts, "ground_beams": len(ground_beams), "rafts": len(rafts)},
+        "elements_generated": {**counts, "ground_beams": len(ground_beams), "rafts": len(rafts), "lift_pits": len(lift_pits)},
         "ruby_line_count": len(lines),
         "warnings": warnings,
         "skipped": skipped,

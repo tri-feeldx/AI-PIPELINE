@@ -257,6 +257,58 @@ def _tables_from_page(page: fitz.Page) -> list:
     return []
 
 
+def extract_concrete_defaults(
+    pdf_path: str,
+    classifications: list[dict],
+) -> dict[str, int]:
+    """Extract default f'c (MPa) per element type from General Notes pages.
+
+    Scans the first few pages for patterns like:
+      "All suspended floors shall be f'c = 40 MPa"
+      "columns ... 65 MPa"
+    Returns: {"slab": 40, "beam": 40, "column": 50, "foundation": 50}
+    """
+    import fitz as _fitz
+
+    defaults: dict[str, int] = {
+        "slab":       40,   # Standard for PT suspended slabs
+        "beam":       40,
+        "column":     50,
+        "foundation": 50,
+    }
+
+    _ELEM_KEYWORDS = {
+        "slab":       ["SLAB", "FLOOR", "SUSPENDED", "FLAT PLATE"],
+        "beam":       ["BEAM", "BAND", "TRANSFER"],
+        "column":     ["COLUMN", "WALL"],
+        "foundation": ["FOOTING", "FOUNDATION", "PILE", "RAFT", "SUBSTRUCTURE"],
+    }
+    _MPa_RE = re.compile(r"f'?c\s*=?\s*(\d{2,3})\s*MPa|(\d{2,3})\s*MPa", re.I)
+
+    doc = _fitz.open(pdf_path)
+    # Check first 8 pages (general notes area)
+    for i in range(min(8, doc.page_count)):
+        text = doc[i].get_text()
+        # Scan paragraph by paragraph
+        for para in text.split("\n"):
+            para_upper = para.upper()
+            m = _MPa_RE.search(para)
+            if not m:
+                continue
+            mpa_val = int(m.group(1) or m.group(2))
+            if not (20 <= mpa_val <= 100):
+                continue
+            for elem_type, keywords in _ELEM_KEYWORDS.items():
+                if any(kw in para_upper for kw in keywords):
+                    if mpa_val > defaults.get(elem_type, 0):
+                        defaults[elem_type] = mpa_val
+                    break
+
+    doc.close()
+    logger.info("extract_concrete_defaults: %s", defaults)
+    return defaults
+
+
 def extract_all_schedules(
     pdf_path: str,
     classifications: list[dict],

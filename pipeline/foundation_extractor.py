@@ -711,10 +711,20 @@ def extract_foundations(page: fitz.Page, grid: dict, global_schedule: dict | Non
                     "material":    "concrete",
                 })
 
+    # ── Lift pits ───────────────────────────────────────────────────────────────
+    lift_pits = _detect_lift_pits(page, grid, pt_mm)
+
+    # ── Planter box slab flag ───────────────────────────────────────────────────
+    has_planter = bool(re.search(
+        r'\bLANDSCAPE\s+SLAB\b|\bPLANTER\s+BOX\b', page.get_text(), re.I
+    ))
+
     return {
         "footings":            footings,
         "ground_beams":        ground_beams,
         "rafts":               rafts,
+        "lift_pits":           lift_pits,
+        "has_planter_slab":    has_planter,
         "schedule":            schedule,
         "pile_spec":           pile_spec,
         "has_foundation_plan": bool(footings or ground_beams or rafts or schedule),
@@ -722,6 +732,47 @@ def extract_foundations(page: fitz.Page, grid: dict, global_schedule: dict | Non
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
+
+_LIFT_PIT_RE = re.compile(
+    r'\b(?:LIFT\s*PIT|ELEVATOR\s*PIT|LP)\b.*?(\d{3,4})\s*(?:DEEP|mm)',
+    re.I | re.DOTALL,
+)
+_LIFT_PIT_LABEL_RE = re.compile(r'\bLP\s*[-/]?\s*(\d+)', re.I)
+
+
+def _detect_lift_pits(page: fitz.Page, grid: dict, pt_mm: float) -> list[dict]:
+    """Detect lift/elevator pit annotations on foundation plan.
+
+    Returns list of {id, grid_ref, x_mm, y_mm, depth_mm, width_mm}.
+    Lift pits are below the core raft — typically 1200-1500mm deeper.
+    """
+    text = page.get_text()
+    x_axes = grid.get("x_axes", [])
+    y_axes = grid.get("y_axes", [])
+
+    pits: list[dict] = []
+
+    for m in _LIFT_PIT_RE.finditer(text):
+        depth_mm = int(m.group(1))
+        if depth_mm < 500 or depth_mm > 3000:
+            continue   # sanity check
+
+        # Lift pits are typically 1200×1200mm to 2400×2400mm
+        pits.append({
+            "id":        f"LP-{len(pits)+1:02d}",
+            "ftype":     "lift_pit",
+            "depth_mm":  depth_mm,
+            "width_mm":  1500,   # typical; actual from drawings would be better
+            "height_mm": depth_mm,
+            "material":  "concrete",
+            "grid_ref":  "off_grid",
+            "x_mm":      0.0,
+            "y_mm":      0.0,
+            "note":      "Lift pit — verify position from drawing",
+        })
+
+    return pits
+
 
 def _label_to_ftype(label: str) -> str:
     lu = label.upper()

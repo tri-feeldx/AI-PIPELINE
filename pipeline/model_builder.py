@@ -21,7 +21,7 @@ from pipeline.element_detector import detect_elements
 from pipeline.level_extractor import extract_levels_from_pdf
 from pipeline.foundation_extractor import extract_foundations, parse_footing_schedule
 from pipeline.quality_gate import assess_quality
-from pipeline.schedule_extractor import extract_all_schedules
+from pipeline.schedule_extractor import extract_all_schedules, extract_concrete_defaults
 
 
 # ── Section dimension lookup (built-in common Australian sections) ─────────────
@@ -94,9 +94,10 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     # ── Stage 2b: Member schedule extraction (columns, beams) ────────────────
     # Uses find_tables() on schedule/detail pages — free, fast, no AI needed.
     # Produces exact column/beam dimensions from structural schedules.
-    member_schedules = extract_all_schedules(pdf_path, classifications)
-    col_schedule  = member_schedules.get("columns", {})
-    beam_schedule = member_schedules.get("beams", {})
+    member_schedules  = extract_all_schedules(pdf_path, classifications)
+    col_schedule      = member_schedules.get("columns", {})
+    beam_schedule     = member_schedules.get("beams", {})
+    concrete_defaults = extract_concrete_defaults(pdf_path, classifications)
 
     # ── Stage 2c: Global foundation schedule pre-scan ─────────────────────────
     # Parse schedule from ALL pages (schedule, detail, foundation_plan).
@@ -145,6 +146,13 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             if not page_grid["x_axes"]:
                 page_grid = grid  # fall back to global grid
 
+            # Detect if this page uses Post-Tensioned construction
+            page_text_upper = page.get_text().upper()
+            page_is_pt = (
+                "POST-TENSION" in page_text_upper
+                or "POST TENSION" in page_text_upper
+            )
+
             elements = detect_elements(page, page_type, page_grid)
 
             # Run dedicated foundation extractor on foundation plan pages.
@@ -182,10 +190,20 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
                 all_columns[ref] = {**col, "source_page": page_num}
 
         for beam in elements["beams"]:
-            all_beams.append({**beam, "source_page": page_num})
+            all_beams.append({
+                **beam,
+                "source_page": page_num,
+                "is_pt": page_is_pt,
+                "fc_mpa": concrete_defaults.get("beam", 40),
+            })
 
         for slab in elements["slabs"]:
-            all_slabs.append({**slab, "source_page": page_num})
+            all_slabs.append({
+                **slab,
+                "source_page": page_num,
+                "is_pt": page_is_pt,
+                "fc_mpa": concrete_defaults.get("slab", 40),
+            })
 
         if progress_cb:
             progress_cb("extract", (idx + 1) / total_pages)
@@ -260,6 +278,7 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             "width_mm":      col_w,
             "depth_mm":      col_d,
             "material":      col_mat,
+            "fc_mpa":        sched_spec.get("fc_mpa", concrete_defaults.get("column", 50)),
             "source_page":   col.get("source_page"),
         })
 
@@ -292,6 +311,8 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             "width_mm":    dims["width_mm"],
             "height_mm":   dims["height_mm"],
             "material":    dims["material"],
+            "is_pt":       beam.get("is_pt", False),
+            "fc_mpa":      beam.get("fc_mpa", 40),
             "source_page": beam.get("source_page"),
         })
 
@@ -315,6 +336,8 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             "elev_mm":     top_lv["elevation_mm"],
             "thickness_mm": 150,
             "material":    "concrete",
+            "is_pt":       slab.get("is_pt", False),
+            "fc_mpa":      slab.get("fc_mpa", 40),
             "source_page": slab.get("source_page"),
         })
 
@@ -336,6 +359,8 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         "foundations":          foundations,
         "ground_beams":         ground_beams,
         "rafts":                rafts,
+        "lift_pits":            foundation_extraction.get("lift_pits", []),
+        "has_planter_slab":     foundation_extraction.get("has_planter_slab", False),
         "foundation_schedule":  foundation_extraction.get("schedule", {}),
         "foundation_pile_spec": foundation_extraction.get("pile_spec", {}),
         "column_schedule":      col_schedule,
@@ -372,14 +397,17 @@ def _merge_foundation_pages(results: list[dict]) -> dict:
     if len(results) == 1:
         return results[0]
 
-    all_footings: list[dict] = []
-    all_gbeams:   list[dict] = []
-    all_rafts:    list[dict] = []
+    all_footings:   list[dict] = []
+    all_gbeams:     list[dict] = []
+    all_rafts:      list[dict] = []
+    all_lift_pits:  list[dict] = []
     merged_schedule: dict = {}
+    has_planter = any(r.get("has_planter_slab", False) for r in results)
 
     x_cursor = 0.0
 
     for bldg_idx, r in enumerate(results):
+        all_lift_pits.extend(r.get("lift_pits", []))
         footings = r.get("footings", [])
         if not footings:
             merged_schedule.update(r.get("schedule", {}))
@@ -418,11 +446,13 @@ def _merge_foundation_pages(results: list[dict]) -> dict:
         x_cursor += bldg_width + 5_000   # 5 m gap between buildings
 
     return {
-        "footings":     all_footings,
-        "ground_beams": all_gbeams,
-        "rafts":        all_rafts,
-        "schedule":     merged_schedule,
-        "pile_spec":    results[0].get("pile_spec", {}),
+        "footings":        all_footings,
+        "ground_beams":    all_gbeams,
+        "rafts":           all_rafts,
+        "lift_pits":       all_lift_pits,
+        "has_planter_slab": has_planter,
+        "schedule":        merged_schedule,
+        "pile_spec":       results[0].get("pile_spec", {}),
         "has_foundation_plan": True,
         "_vision_foundations": any(r.get("_vision_foundations") for r in results),
         "_vision_schedule":    any(r.get("_vision_schedule")    for r in results),

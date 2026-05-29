@@ -64,8 +64,10 @@ def _call_gemini(image_bytes: bytes, prompt: str) -> str:
         contents=[image_part, prompt],
         config=types.GenerateContentConfig(
             temperature=0.0,
-            response_mime_type="application/json",
-            max_output_tokens=32768,  # dense pages can have 80+ items; 32K prevents truncation
+            # No response_mime_type="application/json" — JSON mode has a lower internal
+            # output limit (~2579 chars). Plain text mode returns 2.5× more data.
+            # _parse_json() already strips ```json ... ``` fences.
+            max_output_tokens=32768,
         ),
     )
     return response.text
@@ -73,7 +75,7 @@ def _call_gemini(image_bytes: bytes, prompt: str) -> str:
 
 def _call_gemini_with_retry(image_bytes: bytes, prompt: str, max_retries: int = 3) -> str | None:
     """Call Gemini with exponential backoff on 429 rate-limit errors."""
-    delays = [8, 20, 60]   # seconds to wait before each retry
+    delays = [15, 45, 120]  # Vertex AI QPM window is ~60s; wait ≥60s to clear quota
     for attempt in range(max_retries):
         try:
             return _call_gemini(image_bytes, prompt)

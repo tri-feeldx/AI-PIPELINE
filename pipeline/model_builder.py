@@ -21,6 +21,7 @@ from pipeline.element_detector import detect_elements
 from pipeline.level_extractor import extract_levels_from_pdf
 from pipeline.foundation_extractor import extract_foundations, parse_footing_schedule
 from pipeline.quality_gate import assess_quality
+from pipeline.schedule_extractor import extract_all_schedules
 
 
 # ── Section dimension lookup (built-in common Australian sections) ─────────────
@@ -90,7 +91,14 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     if progress_cb:
         progress_cb("classify", 1.0)
 
-    # ── Stage 2b: Global foundation schedule pre-scan ────────────────────────
+    # ── Stage 2b: Member schedule extraction (columns, beams) ────────────────
+    # Uses find_tables() on schedule/detail pages — free, fast, no AI needed.
+    # Produces exact column/beam dimensions from structural schedules.
+    member_schedules = extract_all_schedules(pdf_path, classifications)
+    col_schedule  = member_schedules.get("columns", {})
+    beam_schedule = member_schedules.get("beams", {})
+
+    # ── Stage 2c: Global foundation schedule pre-scan ─────────────────────────
     # Parse schedule from ALL pages (schedule, detail, foundation_plan).
     # This captures pile cap / pad footing tables that sit on dedicated
     # schedule pages (e.g. ST-003-31 "Foundation Sections and Details")
@@ -223,18 +231,35 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
 
     cols_final = []
     for col in all_columns.values():
+        # Look up actual dimensions from column schedule if available
+        col_mark = col.get("column_mark", col.get("section_label", ""))
+        sched_spec = col_schedule.get(col_mark, {})
+        col_w = sched_spec.get("width_mm", 150)
+        col_d = sched_spec.get("depth_mm", 150)
+        col_mat = sched_spec.get("material", "steel")
+        from_lv_name = sched_spec.get("from_level") or bottom_lv["name"]
+        to_lv_name   = sched_spec.get("to_level")   or top_lv["name"]
+
+        # Resolve level elevation from levels list
+        def _elev(name, default):
+            for lv in levels:
+                if lv["name"] == name:
+                    return lv["elevation_mm"]
+            return default
+
         cols_final.append({
             "id":            f"COL-{len(cols_final)+1:04d}",
             "grid_ref":      col["grid_ref"],
+            "column_mark":   col_mark,
             "x_mm":          col["x_mm"],
             "y_mm":          col["y_mm"],
-            "from_level":    bottom_lv["name"],
-            "from_elev_mm":  bottom_lv["elevation_mm"],
-            "to_level":      top_lv["name"],
-            "to_elev_mm":    top_lv["elevation_mm"],
-            "width_mm":      150,
-            "depth_mm":      150,
-            "material":      "steel",
+            "from_level":    from_lv_name,
+            "from_elev_mm":  _elev(from_lv_name, bottom_lv["elevation_mm"]),
+            "to_level":      to_lv_name,
+            "to_elev_mm":    _elev(to_lv_name, top_lv["elevation_mm"]),
+            "width_mm":      col_w,
+            "depth_mm":      col_d,
+            "material":      col_mat,
             "source_page":   col.get("source_page"),
         })
 
@@ -246,11 +271,18 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         if key in seen_beams:
             continue
         seen_beams.add(key)
-        dims = _section_dims(beam.get("section_label", ""))
+        section_lbl = beam.get("section_label", "")
+        # Prefer beam schedule lookup, fall back to section dims table
+        bsched = beam_schedule.get(section_lbl, {})
+        dims = {
+            "width_mm":  bsched.get("width_mm")  or _section_dims(section_lbl)["width_mm"],
+            "height_mm": bsched.get("depth_mm")  or _section_dims(section_lbl)["height_mm"],
+            "material":  bsched.get("material")  or _section_dims(section_lbl)["material"],
+        }
         beams_final.append({
             "id":          f"BEAM-{len(beams_final)+1:04d}",
             "grid_ref":    beam["grid_ref"],
-            "section_label": beam.get("section_label", ""),
+            "section_label": section_lbl,
             "from_x_mm":   beam["from_x_mm"],
             "from_y_mm":   beam["from_y_mm"],
             "to_x_mm":     beam["to_x_mm"],
@@ -306,6 +338,8 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         "rafts":                rafts,
         "foundation_schedule":  foundation_extraction.get("schedule", {}),
         "foundation_pile_spec": foundation_extraction.get("pile_spec", {}),
+        "column_schedule":      col_schedule,
+        "beam_schedule":        beam_schedule,
         "ai_used": ai_used,
         "summary_counts": {
             "columns":      len(cols_final),

@@ -25,7 +25,7 @@ PT_TO_MM = 25.4 / 72.0
 # Pile / footing type labels
 _PILE_MARK_RE    = re.compile(r'^P(\d+[A-Za-z]?)$',  re.IGNORECASE)   # P1, P2a
 _FOOTING_TYPE_RE = re.compile(
-    r'\b(?:PC|MC|M[DĐ]|MB|SF|RF|CB|F|P|M)(\d+[A-Za-z]?)\b',
+    r'\b(?:PF|PC|MC|M[DĐ]|MB|SF|RF|CB|F|P|M)(\d+[A-Za-z]?)\b',
     re.IGNORECASE,
 )
 
@@ -172,13 +172,63 @@ def parse_footing_schedule(page: fitz.Page) -> dict[str, dict]:
         }
 
         if ftype in ("pile_cap", "bored_pier"):
-            entry["pile_dia_mm"] = _extract_pile_dia_from_row(row_text)
-            entry["pile_len_mm"] = _extract_socket_len_from_row(row_text)
-            if entry["pile_dia_mm"] > 0:
-                d = entry["pile_dia_mm"]
-                entry["width_mm"]  = round(d * 2.0)
-                entry["depth_mm"]  = round(d * 2.0)
-                entry["height_mm"] = round(d * 0.93)
+            # Two possible schedule formats:
+            # A) Pile-centric:  "P1 | 750 | 0.6 | 850 | ..."
+            #    Signature: first large number (300-1050) is followed by a
+            #    small float (0.05-25) = socket length in metres.
+            # B) Cap-centric:   "PC1 | 1400 | 1400 | 1100 | 65"
+            #    Signature: 3 large numbers of similar magnitude, no small float.
+            tokens = row_text.split()
+            is_pile_format = False
+            pile_dia_candidate = 0.0
+            for idx, tok in enumerate(tokens):
+                try:
+                    v = float(tok)
+                    if 300 <= v <= 1050 and v == int(v):
+                        # Check if next token is a small float (socket length in m)
+                        for nxt in tokens[idx + 1:idx + 4]:
+                            try:
+                                nv = float(nxt)
+                                if 0.05 <= nv <= 25.0:
+                                    is_pile_format = True
+                                    pile_dia_candidate = v
+                                    break
+                            except ValueError:
+                                continue
+                        if is_pile_format:
+                            break
+                except ValueError:
+                    continue
+
+            # Also honour explicit Ø/Φ prefix (unambiguous)
+            m_dia = _PILE_DIA_PREFIX_RE.search(row_text)
+            if m_dia:
+                is_pile_format = True
+                pile_dia_candidate = float(m_dia.group(1) or m_dia.group(2))
+
+            if is_pile_format:
+                # Format A — pile-diameter + socket length row
+                entry["pile_dia_mm"] = pile_dia_candidate
+                entry["pile_len_mm"] = _extract_socket_len_from_row(row_text)
+                d = pile_dia_candidate
+                if d > 0:
+                    entry["width_mm"]  = round(d * 2.0)
+                    entry["depth_mm"]  = round(d * 2.0)
+                    entry["height_mm"] = round(d * 0.93)
+            else:
+                # Format B — cap W × L × D (pile spec is elsewhere / geotech report)
+                large_nums = [float(t) for t, _ in row_items
+                              if _is_plain_number(t) and float(t) >= 300]
+                if len(large_nums) >= 3:
+                    entry["width_mm"]  = large_nums[0]
+                    entry["depth_mm"]  = large_nums[1]
+                    entry["height_mm"] = large_nums[2]
+                elif len(large_nums) == 2:
+                    entry["width_mm"]  = large_nums[0]
+                    entry["depth_mm"]  = large_nums[0]
+                    entry["height_mm"] = large_nums[1]
+                entry["pile_len_mm"] = _extract_socket_len_from_row(row_text)
+                # pile_dia stays 0 — will be estimated in ruby_generator
 
         elif ftype == "pad_footing":
             # Australian pad footing schedule: WxDxH inline (e.g. 1200x1200x450)
@@ -685,6 +735,8 @@ def _label_to_ftype(label: str) -> str:
         return "raft"
     if lu.startswith("MB") or lu.startswith("SF"):
         return "strip_footing"
+    if lu.startswith("PF"):
+        return "pad_footing"
     return "pad_footing"
 
 

@@ -176,8 +176,8 @@ def classify_page(page: fitz.Page, page_num: int) -> dict:
 def _has_grid_labels(spans, w, h) -> bool:
     labels = [
         t for t, x, y, sz in spans
-        if sz > 12 and len(t) == 1 and (t.isdigit() or t.isalpha())
-        and (y < h * 0.12 or x > w * 0.7)
+        if sz >= 7 and len(t) <= 3 and (t.isdigit() or t.isalpha())
+        and (y < h * 0.20 or y > h * 0.80 or x < w * 0.20 or x > w * 0.60)
     ]
     return len(labels) >= 2
 

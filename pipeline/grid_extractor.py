@@ -74,6 +74,20 @@ class GridAxis(NamedTuple):
     real_mm: float   # position in real-world mm (zero-based)
 
 
+def _grid_font_threshold(texts: list[tuple[str, float, float, float]]) -> float:
+    """Return minimum font size for grid label candidates.
+
+    Grid labels are typically in the top 30% of font sizes on the page.
+    Uses the 70th percentile of all valid font sizes, clamped to [7, 20] pt.
+    This adapts automatically to any PDF without hardcoded size assumptions.
+    """
+    sizes = sorted(sz for _, _, _, sz in texts if 4 < sz < 100)
+    if len(sizes) < 5:
+        return 7.0
+    p70 = sizes[int(len(sizes) * 0.70)]
+    return max(7.0, min(p70, 20.0))
+
+
 def _extract_texts(page: fitz.Page) -> list[tuple[str, float, float, float]]:
     """Return [(text, x, y, size)] for all text spans."""
     items = []
@@ -137,8 +151,9 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
     x_candidates: list[tuple[str, float]] = []  # (label, x_pos)
     y_candidates: list[tuple[str, float]] = []  # (label, y_pos)
 
+    min_sz = _grid_font_threshold(texts)  # adaptive: 70th-pct of page font sizes
     for text, x, y, sz in texts:
-        if sz < 7:  # Vietnamese PDFs encode grid labels at 8-11pt; was 12
+        if sz < min_sz:
             continue
         clean = text.strip().upper()
         # Allow 1–3 character grid labels; must be all-digits or all-letters
@@ -147,8 +162,8 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
         if not (clean.isdigit() or clean.isalpha()):
             continue
 
-        near_top_bot = (y < content_h * 0.15 or y > content_h * 0.85)
-        near_side    = (x < content_w * 0.15 or x > content_w * 0.65)
+        near_top_bot = (y < content_h * 0.20 or y > content_h * 0.80)
+        near_side    = (x < content_w * 0.20 or x > content_w * 0.60)
 
         if clean.isdigit() and near_top_bot:
             # Numbers near top/bottom → X-axis (standard convention)

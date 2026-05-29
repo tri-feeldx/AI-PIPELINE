@@ -119,7 +119,20 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
 
     # ── Stage 2c: Grid extraction (scale-aware) ───────────────────────────────
     dominant_scale = _detect_dominant_scale(classifications)
-    grid = extract_grids_from_pdf(pdf_path, dominant_scale=dominant_scale)
+    # Pass foundation plan page indices so the per-page fallback in
+    # extract_grids_from_pdf() activates when the global multi-page merge fails.
+    # Common case: 4-building combined PDF where each building has unique grid
+    # labels that appear only once and get filtered by the min_count=2 rule.
+    fdn_page_indices = [
+        cls["page_num"] - 1   # fitz is 0-based; page_num is 1-based
+        for cls in classifications
+        if cls.get("drawing_type") == "foundation_plan"
+    ]
+    grid = extract_grids_from_pdf(
+        pdf_path,
+        plan_page_indices=fdn_page_indices or None,
+        dominant_scale=dominant_scale,
+    )
     if progress_cb:
         progress_cb("grid", 1.0)
 

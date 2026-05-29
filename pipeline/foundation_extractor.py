@@ -106,12 +106,12 @@ def _extract_pile_dia_from_row(row_text: str) -> float:
     if m:
         return float(m.group(1) or m.group(2))
 
-    # Australian column-based: first token that looks like a pile diameter
-    # (integer 400–1200, no alphabetic prefix, not a force value > 1200)
+    # Column-based: first integer token in typical pile diameter range.
+    # Range 250–2000mm covers: micropiles (250-300), standard (400-1200), caissons (1500-2000).
     for tok in row_text.split():
         try:
             v = float(tok)
-            if 400 <= v <= 1200 and v == int(v):
+            if 250 <= v <= 2000 and v == int(v):
                 return v
         except ValueError:
             pass
@@ -127,16 +127,16 @@ def _extract_socket_len_from_row(row_text: str) -> float:
         unit   = (m.group(2) or "m").lower()
         return length * 1000 if unit == "m" else length
 
-    # Australian schedule: first small float token (0.1–25) after the mark label
-    # = socket length in metres (25m is a long pile)
+    # Schedule: first small float token after the mark label = socket/pile length in metres.
+    # Range 0.05–80m: covers shallow AU piles (~5-25m) and deep SE Asia piles (40-60m+).
     tokens = row_text.split()
-    for i, tok in enumerate(tokens):
-        if _FOOTING_TYPE_RE.match(tok):          # skip the mark label itself
+    for tok in tokens:
+        if _FOOTING_TYPE_RE.match(tok):
             continue
         try:
             v = float(tok)
-            if 0.05 <= v <= 25.0 and tok not in ("0", "1"):
-                return v * 1000                  # metres → mm
+            if 0.05 <= v <= 80.0 and tok not in ("0", "1"):
+                return v * 1000   # metres → mm
         except ValueError:
             pass
     return 0.0
@@ -191,12 +191,12 @@ def parse_footing_schedule(page: fitz.Page) -> dict[str, dict]:
             for idx, tok in enumerate(tokens):
                 try:
                     v = float(tok)
-                    if 300 <= v <= 1050 and v == int(v):
+                    if 200 <= v <= 2000 and v == int(v):
                         # Check if next token is a small float (socket length in m)
                         for nxt in tokens[idx + 1:idx + 4]:
                             try:
                                 nv = float(nxt)
-                                if 0.05 <= nv <= 25.0:
+                                if 0.05 <= nv <= 80.0:
                                     is_pile_format = True
                                     pile_dia_candidate = v
                                     break
@@ -244,7 +244,7 @@ def parse_footing_schedule(page: fitz.Page) -> dict[str, dict]:
             if dims:
                 entry["width_mm"]  = dims["width_mm"]
                 entry["depth_mm"]  = dims["depth_mm"]
-                entry["height_mm"] = dims["height_mm"] if dims["height_mm"] > 0 else 500.0
+                entry["height_mm"] = dims["height_mm"] if dims["height_mm"] > 0 else 450.0
             else:
                 # Fallback: first 3 numbers ≥ 300mm in row → W, D, H
                 nums = [float(t) for t, _ in row_items
@@ -273,9 +273,9 @@ def parse_footing_schedule(page: fitz.Page) -> dict[str, dict]:
                 entry["height_mm"] = nums[1]
 
         elif ftype == "raft":
-            # RF1: LENGTH × WIDTH × DEPTH
+            # RF1: LENGTH × WIDTH × DEPTH (thin rafts can be 100-300mm)
             nums = [float(t) for t, _ in row_items
-                    if _is_plain_number(t) and float(t) >= 500]
+                    if _is_plain_number(t) and float(t) >= 100]
             if len(nums) >= 3:
                 entry["width_mm"]  = nums[1]   # plan width
                 entry["depth_mm"]  = nums[0]   # plan length (stored as depth)
@@ -300,10 +300,26 @@ def _is_plain_number(s: str) -> bool:
 
 # ── Annotation detection ───────────────────────────────────────────────────────
 
+def _compute_snap_radius(x_axes: list, y_axes: list) -> float:
+    """Compute snap-to-grid radius from actual grid spacing.
+
+    Uses 25% of the smallest detected bay width/height.
+    Works for any scale: 1:50, 1:100, 1:200, etc.
+    Falls back to 600mm when no grid is available.
+    """
+    spacings = []
+    for axes in [x_axes, y_axes]:
+        for i in range(len(axes) - 1):
+            gap = axes[i + 1]["real_mm"] - axes[i]["real_mm"]
+            if gap > 0:
+                spacings.append(gap)
+    return min(spacings) * 0.25 if spacings else 600.0
+
+
 def find_all_pile_annotations(
     page: fitz.Page,
     grid: dict,
-    snap_radius_mm: float = 600.0,
+    snap_radius_mm: float | None = None,
 ) -> tuple[dict[str, str], list[dict]]:
     """Find ALL pile / footing annotations on the drawing (including off-grid).
 
@@ -314,6 +330,10 @@ def find_all_pile_annotations(
     x_axes = grid.get("x_axes", [])
     y_axes = grid.get("y_axes", [])
     pt_to_mm = grid.get("pt_to_mm", PT_TO_MM * 100)
+
+    # Compute snap radius adaptively from grid spacing (works for any scale)
+    if snap_radius_mm is None:
+        snap_radius_mm = _compute_snap_radius(x_axes, y_axes)
 
     spans = _all_text(page)
     page_w = page.rect.width

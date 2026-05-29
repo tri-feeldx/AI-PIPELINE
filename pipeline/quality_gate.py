@@ -15,10 +15,9 @@ import re
 from dataclasses import dataclass, field
 
 
-_COORD_LIMIT_MM = 30_000   # coords > 30m from origin = wrong
-_DIM_ZERO_THRESH = 0.30    # >30% zero-dim foundations → bad
-_SCHEDULE_OK_THRESH = 0.70  # >70% schedule entries need non-zero dims
-_COVERAGE_MIN = 0.05        # found / (nx*ny) > 5% minimum
+_DIM_ZERO_THRESH    = 0.30   # >30% zero-dim foundations → bad
+_SCHEDULE_OK_THRESH = 0.70   # >70% schedule entries need non-zero dims
+_COVERAGE_MIN       = 0.01   # found / (nx*ny) > 1% minimum (was 5%; sparse grids trigger false AI)
 
 
 @dataclass
@@ -72,13 +71,27 @@ def assess_quality(
         failed.append("foundations")
 
     # ── Coordinate sanity ─────────────────────────────────────────────────────
+    # Use adaptive limit: 3× the detected grid span (or 150m minimum).
+    # This handles large sites and multi-building PDFs without false positives.
+    x_axes_list = grid.get("x_axes", [])
+    y_axes_list = grid.get("y_axes", [])
+    grid_x_span = (
+        x_axes_list[-1]["real_mm"] - x_axes_list[0]["real_mm"]
+        if len(x_axes_list) >= 2 else 0
+    )
+    grid_y_span = (
+        y_axes_list[-1]["real_mm"] - y_axes_list[0]["real_mm"]
+        if len(y_axes_list) >= 2 else 0
+    )
+    coord_limit = max(grid_x_span, grid_y_span, 50_000) * 3
+
     coords_ok = True
     if footings:
         bad_coords = sum(
             1 for f in footings
-            if abs(f.get("x_mm", 0)) > _COORD_LIMIT_MM
-            or abs(f.get("y_mm", 0)) > _COORD_LIMIT_MM
-            or f.get("x_mm", 0) < -5000   # clearly wrong origin
+            if abs(f.get("x_mm", 0)) > coord_limit
+            or abs(f.get("y_mm", 0)) > coord_limit
+            or f.get("x_mm", 0) < -(coord_limit / 2)
         )
         if bad_coords / len(footings) > 0.30:
             coords_ok = False

@@ -420,12 +420,28 @@ confidence: "high" = clearly on grid, "medium" = estimated, "low" = uncertain"""
             item["x_percent"] = tx0 + float(item.get("x_percent", 0.5)) * tw
             item["y_percent"] = ty0 + float(item.get("y_percent", 0.5)) * th
 
-            # Deduplicate by grid_ref (same intersection found in overlapping tiles)
-            gref = item.get("grid_ref", "off_grid")
-            if gref != "off_grid" and gref in seen_grid_refs:
-                continue
+            gref  = item.get("grid_ref", "off_grid")
+            label = str(item.get("label", "?")).upper()
+            xp    = float(item["x_percent"])
+            yp    = float(item["y_percent"])
+
             if gref != "off_grid":
+                # Grid-ref dedup: exact match (same intersection in overlapping tile)
+                if gref in seen_grid_refs:
+                    continue
                 seen_grid_refs.add(gref)
+            else:
+                # Off-grid dedup: proximity + label match.
+                # Tile overlap is ~10% of page → same foundation appears in 2 tiles
+                # at positions differing by < 2% of page width/height.
+                if any(
+                    abs(xp - e["x_percent"]) < 0.02
+                    and abs(yp - e["y_percent"]) < 0.02
+                    and str(e.get("label", "")).upper() == label
+                    for e in all_raw
+                    if e.get("grid_ref", "off_grid") == "off_grid"
+                ):
+                    continue
             all_raw.append(item)
 
     if not all_raw:

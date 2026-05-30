@@ -218,6 +218,7 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None, log_cb=None) -> d
             })
 
     completed_count = 0
+    _best_vision_grid: dict | None = None  # tracks vision-updated grid across workers
 
     def _process_page_worker(cls: dict) -> dict:
         """Worker: opens its own fitz doc, processes one page, returns result dict."""
@@ -242,16 +243,17 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None, log_cb=None) -> d
             else:
                 _fdn_result = extract_foundations(_page, _active_grid, global_schedule)
             _quality = assess_quality(_fdn_result, _active_grid, classifications)
-            _fdn_result = _vision_fallback(_page, _active_grid, _fdn_result, _quality)
+            _fdn_result, _active_grid = _vision_fallback(_page, _active_grid, _fdn_result, _quality)
 
         _doc.close()
         return {
-            "page_num":    cls["page_num"],
+            "page_num":     cls["page_num"],
             "drawing_type": _page_type,
-            "elements":    _elements,
-            "page_is_pt":  _page_is_pt,
-            "fdn_result":  _fdn_result,
-            "cls":         cls,
+            "elements":     _elements,
+            "page_is_pt":   _page_is_pt,
+            "fdn_result":   _fdn_result,
+            "updated_grid": _active_grid,
+            "cls":          cls,
         }
 
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
@@ -293,6 +295,11 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None, log_cb=None) -> d
                                   "is_pt": page_is_pt,
                                   "fc_mpa": concrete_defaults.get("slab", 40)})
 
+            # Capture vision-updated grid (may have Y-axis populated by Vision AI)
+            updated_grid = result.get("updated_grid", {})
+            if updated_grid.get("y_axes") and not (_best_vision_grid and _best_vision_grid.get("y_axes")):
+                _best_vision_grid = updated_grid
+
             if fdn_result is not None:
                 n_found = len(fdn_result.get("footings", []))
                 _log(f"  Page {page_num}: OVERALL (1:{cls.get('scale_ratio','?')}) — {n_found} foundations")
@@ -309,6 +316,10 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None, log_cb=None) -> d
         "grid": grid,
         "pages": page_extractions,
     })
+
+    # Apply vision-updated grid so unified["grid_system"] reflects real Y-axis labels
+    if _best_vision_grid and _best_vision_grid.get("y_axes"):
+        grid = _best_vision_grid
 
     # ── Stage 4a: Level heights ───────────────────────────────────────────────
     levels = extract_levels_from_pdf(pdf_path)
@@ -606,9 +617,10 @@ def _vision_fallback(
     grid: dict,
     fdn_result: dict,
     quality,
-) -> dict:
+) -> tuple[dict, dict]:
     """Run targeted Vision AI calls to fill specific extraction gaps.
 
+    Returns (improved_fdn_result, updated_grid) — grid may have vision Y-axis added.
     Only imports vision_extractor when actually needed (keeps startup fast
     and avoids Vertex AI auth errors when AI is not configured).
     """
@@ -623,7 +635,7 @@ def _vision_fallback(
         )
     except ImportError as e:
         log.warning("vision_extractor import failed (%s) — skipping AI fallback", e)
-        return fdn_result
+        return fdn_result, grid
 
     improved = dict(fdn_result)
     failed = quality.failed_checks
@@ -665,7 +677,7 @@ def _vision_fallback(
                 ]
             improved["_vision_foundations"] = True
 
-    return improved
+    return improved, grid
 
 
 def _apply_vision_grid(vision_grid: dict, page: fitz.Page, fallback_grid: dict) -> dict:

@@ -143,11 +143,17 @@ def _parse_json(text: str) -> dict | list | None:
     text = re.sub(r'\bInfinity\b', '0',     text)
     text = re.sub(r'\bTrue\b',     'true',  text)
     text = re.sub(r'\bFalse\b',    'false', text)
+    text = re.sub(r'\bundefined\b', 'null', text)           # JS undefined
+    text = re.sub(r',(\s*[}\]])',   r'\1',  text)           # trailing comma
+    text = re.sub(r'(?<=[:\[,\s])\.(\d)',   r'0.\1', text)  # .05 → 0.05
+    text = re.sub(r'//[^\n]*',      '',     text)           # // line comments
 
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        logger.warning("JSON parse error from Gemini: %s | text[:200]=%s", e, text[:200])
+        err_pos = getattr(e, 'pos', 0)
+        context = text[max(0, err_pos - 40):err_pos + 40]
+        logger.warning("JSON parse error from Gemini: %s | context@%d=[%s]", e, err_pos, context)
 
     # Partial-JSON recovery for truncated array responses.
     # Strategy: walk through the text collecting complete JSON objects one by one.

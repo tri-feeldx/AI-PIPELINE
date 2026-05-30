@@ -417,14 +417,15 @@ ACCURACY RULES:
 - Do NOT guess grid_ref — if unsure use "off_grid" with x/y
 - Each physical occurrence of a mark = one entry (P1 at 4 corners = 4 separate entries)
 
-OUTPUT FORMAT — COMPACT JSON, one object per line, no extra whitespace:
-On-grid example:  {{"label":"P1","grid_ref":"A/1"}}
-Off-grid example: {{"label":"P3","grid_ref":"off_grid","x_percent":0.05,"y_percent":0.50}}
+OUTPUT FORMAT — COMPACT JSON, one object per line, no extra whitespace.
+ALWAYS include x_percent and y_percent for EVERY foundation (both on-grid and off-grid):
+{{"label":"P1","grid_ref":"A/1","x_percent":0.15,"y_percent":0.22}}
+{{"label":"P3","grid_ref":"off_grid","x_percent":0.05,"y_percent":0.50}}
 
 Return ONLY the JSON array, no explanation:
 [
-{{"label":"P1","grid_ref":"A/1"}},
-{{"label":"P1","grid_ref":"A/2"}},
+{{"label":"P1","grid_ref":"A/1","x_percent":0.15,"y_percent":0.22}},
+{{"label":"P1","grid_ref":"A/2","x_percent":0.28,"y_percent":0.22}},
 {{"label":"P3","grid_ref":"off_grid","x_percent":0.05,"y_percent":0.50}}
 ]"""
 

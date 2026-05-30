@@ -1,0 +1,150 @@
+================================================================================
+  AI-PIPELINE — PROGRESS REPORT
+  Date: 2026-05-30 (Friday)
+  Project: Structural PDF → SketchUp 3D (Auto-Foundation Detection)
+  Engineer: AI Assistant (Claude Sonnet 4.6)
+================================================================================
+
+OBJECTIVE
+---------
+Build a pipeline that processes ANY structural PDF and generates a 100% accurate
+3D SketchUp model (foundations, columns, beams, slabs) without any file-specific
+customization.
+
+Test case: "combine strc.pdf" (88 pages, 4 AU buildings)
+Expected foundation count: 157 (PC1:73, PF1:44, PF2:30, PF3:5, PF4:5)
+
+
+PROGRESS TIMELINE TODAY
+-----------------------
+
+Start of day: 362 foundations (overcounting)
+  Root cause: Vision AI running on BOTH overview page (1:250) AND detail pages
+  (1:100) which are zoomed sections of the same area. All stacked as separate
+  buildings → 2.3× overcounting.
+
+  Fix: Added _assign_foundation_roles() — detects OVERALL vs DETAIL pages by
+  scale ratio (max >= 1.5x min). DETAIL pages skip Vision AI, OVERALL pages
+  run it. Commit: dbfa74d
+
+After fix 1: 213 foundations (still overcounting)
+  Root cause: Vision AI was reading the schedule TABLE (a list of foundation
+  types with dimensions in the corner of the drawing) as placed foundations.
+  E.g., listing "PG1, PG2, L-D1, L-D2..." as plan annotations.
+
+  Fix: Added CRITICAL DISTINCTION section to prompt. Clearly separated:
+  TYPE 1 (plan annotations — COUNT THESE) vs
+  TYPE 2 (schedule table entries — IGNORE COMPLETELY)
+  Also added schedule-guided filter: if schedule has ≥3 known marks, drop
+  any Vision AI result whose label isn't in the schedule.
+
+After fix 2: 122 foundations (undercounting)
+  Root cause 1: Gemini outputs Python literals (None, NaN, True) inside JSON
+  → json.loads fails → partial recovery stops at object 17 of ~50.
+  Fix: Added regex normalisation in _parse_json(): None→null, NaN→0, etc.
+
+  Root cause 2: Y-axis grid was never populated from Vision AI because the
+  condition was "if NOT x AND NOT y" — when X existed, Y was never fetched.
+  Fix: Changed condition to "if NOT y" so Vision AI always provides Y-axis.
+
+  Root cause 3: Download button disappears after clicking (Streamlit rerun
+  clears state). Fix: Save job results to session_state, render from there.
+
+After fix 3: 122 foundations (still undercounting)
+  Root cause: Gemini's internal output limit is ~2600 chars. With 2x2 tiles,
+  each tile had ~50 foundations × 120 chars/object = 6000 chars → truncated
+  after object 17. Context logging confirmed: Gemini closed the JSON array
+  mid-object with `"grid_ref":]` at exactly char 2599.
+
+  Fix: Switched to 3x3 tiling (9 tiles instead of 4). Each tile now has
+  ~17 foundations × 40 chars = 680 chars — well under the 2600 limit.
+  Also compacted the prompt schema to drop verbose fields.
+
+After fix 4: 156 foundations ✓ (target: 157, delta = 1)
+  COUNT is now essentially correct.
+  However: POSITIONS are still scattered/wrong in SketchUp.
+
+  Root cause (identified, fix in progress): The compact schema dropped
+  x_percent/y_percent for on-grid foundations. When grid_ref label matching
+  fails (Gemini returns "10/11" but grid has different label format), code
+  falls back to the tile CENTER coordinates (0.5) instead of actual position.
+
+  Fix applied (commit pending): Restored x_percent/y_percent for ALL objects
+  in the compact schema. 17 objects × 70 chars = 1190 chars — still safe.
+  When grid snap works → exact position. When it fails → Gemini's x/y %.
+
+
+CURRENT STATE (end of day)
+--------------------------
+  Foundation count:    156 / 157  [PASS — within 1%]
+  Foundation positions: SCATTERED  [FAIL — fix applied, awaiting test]
+  Log download:        FIXED ✓
+  Y-axis grid:         FIXED ✓
+  JSON robustness:     FIXED ✓
+  OVERALL/DETAIL:      FIXED ✓
+
+  Test suite: 5 unit tests — ALL PASS (0.18s)
+    TC-1: JSON bad literal handling (None/NaN/undefined)
+    TC-2: Truncated JSON partial recovery
+    TC-3: OVERALL vs DETAIL role assignment
+    TC-4: Schedule-guided filter
+    TC-5: Foundation deduplication (vector preferred over vision_ai)
+
+
+COMMITS TODAY
+-------------
+  d1301f2  fix(pipeline): fix count accuracy + make all thresholds adaptive
+  dbfa74d  fix(pipeline): fix grid detection + foundation accuracy
+  96bdaba  feat(tooling): integrate CodeGraph MCP
+  c9ad8bb  feat(app): save pipeline log to file per job + download button
+  d39b7fe  fix(vision): filter column marks + deduplicate pile_dia warnings
+  f0be9d6  fix(app+vision): log download persistence + Y-grid + JSON robustness
+  5874fb2  test(pipeline): 5 test cases + more JSON normalisations
+  9cfac57  fix(vision): 3x3 tiling + compact JSON schema (TRUNCATION FIX)
+  [latest] fix(vision): restore x/y in compact schema (POSITION FIX)
+
+
+REMAINING ISSUES
+----------------
+  1. Foundation POSITIONS scattered (fix applied today, test Monday)
+  2. Grid display shows "3×0" in UI (cosmetic — actual positions use vision grid)
+  3. No test for end-to-end foundation count (requires Gemini API call)
+  4. Columns, beams, slabs: 0 extracted (likely needs separate schedule pages)
+
+
+NEXT STEPS (Monday)
+-------------------
+  1. Confirm position fix works (upload page_25.pdf, check SketchUp alignment)
+  2. If positions correct: test full "combine strc.pdf" (88 pages, 4 buildings)
+  3. Fix UI grid display: propagate vision-updated grid to unified["grid_system"]
+  4. Add TC-6: end-to-end snapshot test (save Gemini fixture, assert count 145-165)
+  5. Begin column/beam extraction if foundation is confirmed accurate
+
+
+ARCHITECTURE (for PM context)
+------------------------------
+  PDF → Page Classifier → Grid Extractor (vector)
+                        → Foundation Extractor (vector, fast)
+                        → Quality Gate (checks count/grid/coords)
+                        → Vision AI Fallback (Gemini 2.5 Flash, only if needed)
+                             ├── extract_grid_vision()   — Y-axis recovery
+                             ├── extract_schedule_vision() — pile specs
+                             └── extract_foundations_vision() — 3x3 tiles
+                        → Ruby Generator → sketchup_model.rb
+
+  The "Vision AI only when needed" design keeps costs low. For most pages,
+  vector extraction is sufficient. Vision AI is a targeted fallback.
+
+
+ACCURACY METRICS TRACKING
+--------------------------
+  Run date    | Foundations | Target | Delta | Main issue
+  ------------|-------------|--------|-------|---------------------------
+  2026-05-29  |     362     |  157   | +130% | OVERALL/DETAIL not separated
+  2026-05-30a |     213     |  157   | +36%  | Schedule table read as plan
+  2026-05-30b |     122     |  157   | -22%  | JSON truncation (2600 limit)
+  2026-05-30c |     122     |  157   | -22%  | (same, JSON fix didn't reach root)
+  2026-05-30d |     156     |  157   |  -1%  | ✓ COUNT SOLVED
+  2026-05-30e |    TBD      |  157   |  TBD  | Position fix applied, test Mon
+
+================================================================================

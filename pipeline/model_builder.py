@@ -11,6 +11,7 @@ and stage4_unified_model.json.
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import fitz
@@ -175,113 +176,131 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None, log_cb=None) -> d
     if progress_cb:
         progress_cb("grid", 1.0)
 
-    # ── Stage 3: Element detection per plan page ──────────────────────────────
+    # ── Stage 3: Element detection — 2-phase parallel processing ────────────────
     plan_types = {"floor_plan", "roof_plan", "foundation_plan"}
     page_extractions = []
-    all_columns: dict[str, dict] = {}   # key = "Y/X" grid ref
+    all_columns: dict[str, dict] = {}
     all_beams:   list[dict] = []
     all_slabs:   list[dict] = []
-
-    # Foundation extraction results — collect ALL foundation_plan pages,
-    # then merge with X-offset so multi-building PDFs include every building.
     all_fdn_results: list[dict] = []
 
-    for idx, cls in enumerate(classifications):
-        page_num  = cls["page_num"]
-        page_type = cls["drawing_type"]
-        page      = doc[page_num - 1]
+    # Phase 3a — Serial: DETAIL foundation pages (schedule scan only, fast).
+    # Must run BEFORE parallel workers so global_schedule is complete when
+    # OVERALL pages run Vision AI (schedule-guided filter needs it).
+    for cls in classifications:
+        if cls["drawing_type"] == "foundation_plan" and cls.get("plan_role") == "detail":
+            pg = doc[cls["page_num"] - 1]
+            extra_sched = parse_footing_schedule(pg)
+            for mark, spec in extra_sched.items():
+                if mark not in global_schedule:
+                    global_schedule[mark] = spec
+            _log(f"  Page {cls['page_num']}: DETAIL (1:{cls.get('scale_ratio','?')}) — schedule scan only")
 
-        if page_type in plan_types:
-            # Extract grid for THIS page to use for element detection
-            # (some pages may use different scales or partial grids)
-            page_grid = extract_grid(page, grid.get("scale", 100))
-            if not page_grid["x_axes"]:
-                page_grid = grid  # fall back to global grid
+    doc.close()  # workers each open their own fitz.Document (fitz not thread-safe)
 
-            # Detect if this page uses Post-Tensioned construction
-            page_text_upper = page.get_text().upper()
-            page_is_pt = (
-                "POST-TENSION" in page_text_upper
-                or "POST TENSION" in page_text_upper
-            )
-
-            elements = detect_elements(page, page_type, page_grid)
-
-            # Run dedicated foundation extractor on foundation plan pages.
-            # Vision AI always runs on OVERALL pages — it is the authoritative extractor.
-            # DETAIL pages (enlarged sections of the same plan) are harvested for
-            # schedule data only to avoid counting the same foundations multiple times.
-            if page_type == "foundation_plan":
-                active_grid = page_grid if page_grid["x_axes"] else grid
-
-                if cls.get("plan_role") == "detail":
-                    # Detail section: same physical area as the OVERALL page but zoomed in.
-                    # Extract schedule/pile spec only — positions come from the OVERALL page.
-                    extra_sched = parse_footing_schedule(page)
-                    for mark, spec in extra_sched.items():
-                        if mark not in global_schedule:
-                            global_schedule[mark] = spec
-                    _log(f"  Page {page_num}: DETAIL (1:{cls.get('scale_ratio','?')}) — schedule scan only, skipping Vision AI")
-                else:
-                    # OVERALL page: extract positions via vector + Vision AI
-                    _log(f"  Page {page_num}: OVERALL (1:{cls.get('scale_ratio','?')}) — running Vision AI")
-
-                    if cls.get("image_only"):
-                        # Rasterized page: no vector text to parse — go straight to Vision AI
-                        fdn_result = {"has_foundation_plan": True, "footings": [], "schedule": {}}
-                    else:
-                        fdn_result = extract_foundations(page, active_grid, global_schedule)
-
-                    # Vision AI always runs for OVERALL pages regardless of vector result.
-                    # Vector positions are unreliable when grid detection fails (common for
-                    # multi-building combined PDFs where each building has unique grid labels).
-                    quality = assess_quality(fdn_result, active_grid, classifications)
-                    fdn_result = _vision_fallback(page, active_grid, fdn_result, quality)
-
-                    n_found = len(fdn_result.get("footings", []))
-                    _log(f"    → found {n_found} foundations on page {page_num}")
-
-                    # Collect every OVERALL foundation page (multi-building support)
-                    if fdn_result.get("has_foundation_plan") or fdn_result.get("footings"):
-                        all_fdn_results.append(fdn_result)
-        else:
-            elements = {"columns": [], "beams": [], "slabs": []}
-
-        page_extractions.append({
-            "page_num": page_num,
-            "drawing_type": page_type,
-            "columns_found": len(elements["columns"]),
-            "beams_found":   len(elements["beams"]),
-            "slabs_found":   len(elements["slabs"]),
-            "raw": elements,
-        })
-
-        # Merge into global collections (deduplicate by grid ref)
-        for col in elements["columns"]:
-            ref = col["grid_ref"]
-            if ref not in all_columns:
-                all_columns[ref] = {**col, "source_page": page_num}
-
-        for beam in elements["beams"]:
-            all_beams.append({
-                **beam,
-                "source_page": page_num,
-                "is_pt": page_is_pt,
-                "fc_mpa": concrete_defaults.get("beam", 40),
+    # Phase 3b — Parallel: all non-DETAIL plan pages (Vision AI + element detection).
+    _MAX_WORKERS = 6
+    pages_to_process = [
+        cls for cls in classifications
+        if cls["drawing_type"] in plan_types
+        and not (cls["drawing_type"] == "foundation_plan" and cls.get("plan_role") == "detail")
+    ]
+    # Non-plan pages get empty elements (no worker needed)
+    for cls in classifications:
+        if cls["drawing_type"] not in plan_types:
+            page_extractions.append({
+                "page_num":      cls["page_num"],
+                "drawing_type":  cls["drawing_type"],
+                "columns_found": 0,
+                "beams_found":   0,
+                "slabs_found":   0,
+                "raw":           {"columns": [], "beams": [], "slabs": []},
             })
 
-        for slab in elements["slabs"]:
-            all_slabs.append({
-                **slab,
-                "source_page": page_num,
-                "is_pt": page_is_pt,
-                "fc_mpa": concrete_defaults.get("slab", 40),
+    completed_count = 0
+
+    def _process_page_worker(cls: dict) -> dict:
+        """Worker: opens its own fitz doc, processes one page, returns result dict."""
+        _doc  = fitz.open(pdf_path)
+        _page = _doc[cls["page_num"] - 1]
+        _page_type = cls["drawing_type"]
+
+        _page_grid = extract_grid(_page, grid.get("scale", 100))
+        if not _page_grid["x_axes"]:
+            _page_grid = grid
+
+        _page_text = _page.get_text().upper()
+        _page_is_pt = "POST-TENSION" in _page_text or "POST TENSION" in _page_text
+
+        _elements = detect_elements(_page, _page_type, _page_grid)
+
+        _fdn_result = None
+        if _page_type == "foundation_plan":
+            _active_grid = _page_grid if _page_grid["x_axes"] else grid
+            if cls.get("image_only"):
+                _fdn_result = {"has_foundation_plan": True, "footings": [], "schedule": {}}
+            else:
+                _fdn_result = extract_foundations(_page, _active_grid, global_schedule)
+            _quality = assess_quality(_fdn_result, _active_grid, classifications)
+            _fdn_result = _vision_fallback(_page, _active_grid, _fdn_result, _quality)
+
+        _doc.close()
+        return {
+            "page_num":    cls["page_num"],
+            "drawing_type": _page_type,
+            "elements":    _elements,
+            "page_is_pt":  _page_is_pt,
+            "fdn_result":  _fdn_result,
+            "cls":         cls,
+        }
+
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        future_to_cls = {pool.submit(_process_page_worker, cls): cls for cls in pages_to_process}
+        for fut in as_completed(future_to_cls):
+            result = fut.result()
+            completed_count += 1
+            if progress_cb:
+                progress_cb("extract", completed_count / max(total_pages, 1))
+
+            page_num   = result["page_num"]
+            page_type  = result["drawing_type"]
+            elements   = result["elements"]
+            page_is_pt = result["page_is_pt"]
+            fdn_result = result["fdn_result"]
+            cls        = result["cls"]
+
+            page_extractions.append({
+                "page_num":      page_num,
+                "drawing_type":  page_type,
+                "columns_found": len(elements["columns"]),
+                "beams_found":   len(elements["beams"]),
+                "slabs_found":   len(elements["slabs"]),
+                "raw":           elements,
             })
 
-        if progress_cb:
-            progress_cb("extract", (idx + 1) / total_pages)
+            for col in elements["columns"]:
+                ref = col["grid_ref"]
+                if ref not in all_columns:
+                    all_columns[ref] = {**col, "source_page": page_num}
 
-    doc.close()
+            for beam in elements["beams"]:
+                all_beams.append({**beam, "source_page": page_num,
+                                  "is_pt": page_is_pt,
+                                  "fc_mpa": concrete_defaults.get("beam", 40)})
+
+            for slab in elements["slabs"]:
+                all_slabs.append({**slab, "source_page": page_num,
+                                  "is_pt": page_is_pt,
+                                  "fc_mpa": concrete_defaults.get("slab", 40)})
+
+            if fdn_result is not None:
+                n_found = len(fdn_result.get("footings", []))
+                _log(f"  Page {page_num}: OVERALL (1:{cls.get('scale_ratio','?')}) — {n_found} foundations")
+                if fdn_result.get("has_foundation_plan") or fdn_result.get("footings"):
+                    all_fdn_results.append(fdn_result)
+
+    # Sort page_extractions by page_num for consistent JSON output
+    page_extractions.sort(key=lambda e: e["page_num"])
 
     _write_json(job_dir / "stage3_vector_extractions.json", {
         "stage": 3,

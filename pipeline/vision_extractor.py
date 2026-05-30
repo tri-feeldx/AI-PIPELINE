@@ -358,18 +358,41 @@ The structural grid visible in this drawing has:
 
 Known foundation types from schedule: {known_marks if known_marks else 'detect from drawing (P1,P2,PC1,F1,F2,CB1,RF1 etc.)'}
 
-TASK: Find every foundation annotation in the drawing.
-For EACH foundation:
-  1. Read its exact mark label (e.g. P1, PC2, F1)
-  2. Identify which grid intersection it sits ON — this is critical for accuracy.
-     grid_ref format = "Y_label/X_label" e.g. "A/1", "B/3", "AA/5"
+━━━ CRITICAL DISTINCTION — READ THIS FIRST ━━━
+There are TWO types of mark text visible on this drawing. Only count TYPE 1:
+
+TYPE 1 — PLAN ANNOTATIONS (COUNT THESE):
+  Mark labels placed directly ON pile cap symbols or footing outlines within
+  the main plan drawing area. Each sits at a specific XY position on the plan.
+  Looks like: a small "PG1" label on top of a square/rectangle cap symbol.
+
+TYPE 2 — SCHEDULE TABLE ENTRIES (IGNORE COMPLETELY):
+  A table (usually in a corner) listing mark types with dimension columns:
+    MARK | CAP SIZE | PILE DIA | SOCKET | NO. PILES
+    PG1  | 1500×700 |   750    |  12m   |     2
+    PG2  | 1200×600 |   600    |  10m   |     1
+  These are SPECIFICATIONS, not placed positions. Do NOT count table rows.
+
+ALSO IGNORE (do not count anything from these areas):
+  - Keyplan / locator diagram (small overview map, usually top-right corner)
+  - Title block (bottom strip with drawing number, date, revision)
+  - Section callout bubbles (circles with numbers like ①②③)
+  - Dimension lines and leader arrows
+  - North arrow and scale bar
+
+━━━ TASK ━━━
+Find every foundation annotation PLACED ON THE PLAN DRAWING (not in tables).
+For EACH placed foundation:
+  1. Read its exact mark label (e.g. P1, PC2, F1, PG3)
+  2. Identify which grid intersection it sits ON.
+     grid_ref format = "Y_label/X_label" e.g. "A/1", "B/3"
   3. ONLY if not on a grid intersection: record x_percent, y_percent (0.0–1.0 from top-left)
 
 ACCURACY RULES:
-- A foundation sitting on grid line intersection A×1 → grid_ref="A/1", is_on_grid=true
-- A foundation between grid lines (off-grid) → grid_ref="off_grid", is_on_grid=false, give x_percent/y_percent
+- Foundation on grid intersection A×1 → grid_ref="A/1", is_on_grid=true
+- Foundation off-grid → grid_ref="off_grid", is_on_grid=false, give x_percent/y_percent
 - Do NOT guess grid_ref — if unsure, set is_on_grid=false
-- Count repeated marks (e.g. P1 appears at every exterior corner)
+- Each physical occurrence of a mark = one entry (P1 at 4 corners = 4 entries)
 
 Return ONLY valid JSON array, no explanation:
 [
@@ -446,6 +469,25 @@ confidence: "high" = clearly on grid, "medium" = estimated, "low" = uncertain"""
 
     if not all_raw:
         return None
+
+    # Schedule-guided filter: if we have ≥3 known marks from the schedule,
+    # remove any Vision AI result whose label doesn't match a known mark type.
+    # This is a safety net against schedule-table rows that slipped past the prompt.
+    if schedule and len(schedule) >= 3:
+        known_upper = {k.upper() for k in schedule}
+        before = len(all_raw)
+        all_raw = [f for f in all_raw if str(f.get("label", "")).upper() in known_upper]
+        removed = before - len(all_raw)
+        if removed:
+            logger.info(
+                "Schedule filter: dropped %d unrecognised marks (kept %d/%d)",
+                removed, len(all_raw), before,
+            )
+
+    if not all_raw:
+        logger.warning("extract_foundations_vision: all results filtered by schedule — returning None")
+        return None
+
     return _convert_vision_fdns_to_model(all_raw, grid, schedule, page)
 
 

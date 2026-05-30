@@ -68,6 +68,38 @@ def _is_valid_grid_axis(sorted_by_pos: list[tuple[str, float]]) -> bool:
     return True
 
 
+def _extract_monotone_subsequence(
+    sorted_by_pos: list[tuple[str, float]],
+) -> list[tuple[str, float]]:
+    """Return the longest forward-increasing subsequence of labels by value.
+
+    Used when a multi-building PDF shows labels from adjacent buildings on the
+    same page (e.g. [...12, 01, 02, 03...] where 12 is from building-left and
+    01-03 from building-right). Starting from the minimum-value label and
+    greedily scanning forward produces the correct single-building subset.
+
+    Returns the original list unchanged if already monotone or too short.
+    """
+    if len(sorted_by_pos) < 2:
+        return sorted_by_pos
+
+    labels = [lbl for lbl, _ in sorted_by_pos]
+    try:
+        vals = [int(lbl) for lbl in labels]
+    except ValueError:
+        vals = [ord(lbl[0]) for lbl in labels]  # letter grid: use char code
+
+    min_idx = vals.index(min(vals))
+    result = [sorted_by_pos[min_idx]]
+    last_val = vals[min_idx]
+    for i in range(min_idx + 1, len(sorted_by_pos)):
+        if vals[i] > last_val:
+            result.append(sorted_by_pos[i])
+            last_val = vals[i]
+
+    return result if len(result) >= 2 else sorted_by_pos
+
+
 class GridAxis(NamedTuple):
     label: str
     pdf_pos: float   # position on PDF page (x for vertical grid lines, y for horizontal)
@@ -146,10 +178,22 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
 
     # Grid labels: large font (>7pt), near the drawing border.
     # Support single-char (1, A) AND multi-char (AA, AB, 10, 11) labels.
-    # Numbers OR letters near TOP/BOTTOM  → X-axis (vertical grid lines).
-    # Letters near LEFT/RIGHT (but NOT top/bottom) → Y-axis (horizontal grid lines).
-    x_candidates: list[tuple[str, float]] = []  # (label, x_pos)
-    y_candidates: list[tuple[str, float]] = []  # (label, y_pos)
+    # Convention A (standard): Numbers top/bottom → X-axis; Letters left/right → Y-axis.
+    # Convention B (AU combined plans): Numbers used for BOTH axes —
+    #   numbers at top/bottom border → X-axis (vertical grid lines),
+    #   numbers at LEFT or RIGHT border (varying y, consistent x) → Y-axis.
+    x_top_candidates: list[tuple[str, float]] = []     # (label, x_pos) — near top edge
+    x_bot_candidates: list[tuple[str, float]] = []     # (label, x_pos) — near bottom edge
+    y_candidates: list[tuple[str, float, float]] = []  # (label, y_pos, x_pos)
+
+    # Border thresholds: top/bottom within 12% of height, side within 10% or past 75%.
+    # 12% top/bottom captures grid labels that sit in a wide title-block gutter
+    # (some AU combined drawings put labels at ~8-10% from edge) while still
+    # rejecting interior revision callouts that appear at 15-20%.
+    near_top_strict  = content_h * 0.12
+    near_bot_strict  = content_h * 0.88
+    near_left_strict = content_w * 0.10
+    near_right_strict = content_w * 0.75
 
     min_sz = _grid_font_threshold(texts)  # adaptive: 70th-pct of page font sizes
     for text, x, y, sz in texts:
@@ -162,41 +206,96 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
         if not (clean.isdigit() or clean.isalpha()):
             continue
 
-        near_top_bot = (y < content_h * 0.20 or y > content_h * 0.80)
-        near_side    = (x < content_w * 0.20 or x > content_w * 0.60)
+        near_top    = y < near_top_strict
+        near_bot    = y > near_bot_strict
+        near_left   = x < near_left_strict
+        near_right  = x > near_right_strict
+        near_top_bot = near_top or near_bot
+        near_side    = near_left or near_right
 
-        if clean.isdigit() and near_top_bot:
-            # Numbers near top/bottom → X-axis (standard convention)
-            x_candidates.append((clean, x))
+        if clean.isdigit():
+            if len(clean) <= 2:
+                if near_top:
+                    x_top_candidates.append((clean, x))
+                elif near_bot:
+                    # Bottom border used only when no top candidates found.
+                    # Titleblock/schedule tables at bottom create 3-digit noise
+                    # (already filtered above) but single/2-digit table cells
+                    # also appear — kept separate so top-border takes priority.
+                    x_bot_candidates.append((clean, x))
+            elif near_side and not near_top_bot and len(clean) <= 2:
+                # Numbers strictly at left/right side (1-2 digit = grid line number,
+                # NOT 3-digit dimension values like 750mm, 500mm, 400mm).
+                # Common in AU combined drawings using sequential numbers for both axes.
+                y_candidates.append((clean, y, x))
         elif clean.isalpha():
-            if near_side and not near_top_bot:
-                # Single/multi-char letters at left/right only → Y-axis
-                y_candidates.append((clean, y))
+            if near_side:
+                # Letters at left/right (including corners) → Y-axis
+                y_candidates.append((clean, y, x))
             elif near_top_bot and len(clean) > 1:
                 # Multi-char letters (AA, AB, BA...) at top/bottom edge → X-axis
                 # Skip single-char to avoid section marks (A-A, B-B cutlines)
-                x_candidates.append((clean, x))
+                if near_top:
+                    x_top_candidates.append((clean, x))
+                else:
+                    x_bot_candidates.append((clean, x))
 
-    # Deduplicate by label (keep first occurrence per label)
+    # Prefer top-border X-axis candidates; fall back to bottom-border only if top empty.
+    x_candidates = x_top_candidates if x_top_candidates else x_bot_candidates
+
+    # Deduplicate x by label (keep first occurrence per label)
     seen_x: dict[str, float] = {}
     for label, pos in sorted(x_candidates, key=lambda a: a[1]):
         if label not in seen_x:
             seen_x[label] = pos
 
+    # Y-axis: cluster candidates by x-position (within 5% of page width).
+    # True grid labels sit at a consistent x (e.g. all at x=1880 near the right
+    # border). Schedule/table noise sits at a different x cluster (e.g. x=2300+).
+    # Take the x-cluster with the most candidates and use only those labels.
     seen_y: dict[str, float] = {}
-    for label, pos in sorted(y_candidates, key=lambda a: a[1]):
-        if label not in seen_y:
-            seen_y[label] = pos
+    if y_candidates:
+        # Build x-bands (±5% of page width tolerance)
+        x_band_tol = content_w * 0.05
+        bands: list[list[tuple[str, float, float]]] = []
+        for cand in sorted(y_candidates, key=lambda a: a[2]):  # sort by x_pos
+            label, y_pos, x_pos = cand
+            placed = False
+            for band in bands:
+                if abs(x_pos - band[0][2]) <= x_band_tol:
+                    band.append(cand)
+                    placed = True
+                    break
+            if not placed:
+                bands.append([cand])
+        # Pick the band with the most candidates (ties: prefer rightmost = near border)
+        dominant = max(bands, key=lambda b: (len(b), b[0][2]))
+        for label, y_pos, _x in sorted(dominant, key=lambda a: a[1]):
+            if label not in seen_y:
+                seen_y[label] = y_pos
 
-    # Sort by position, then validate as genuine structural grid axes
+    # Sort by position, then validate as genuine structural grid axes.
+    # When validation fails, attempt to salvage by extracting the longest
+    # forward-increasing subsequence (handles multi-building PDFs where labels
+    # from adjacent buildings create apparent inversions in position order).
     sorted_x = sorted(seen_x.items(), key=lambda a: a[1])
     sorted_y = sorted(seen_y.items(), key=lambda a: a[1])
     if not _is_valid_grid_axis(sorted_x):
-        _log.debug("grid_extractor: x-axis rejected — labels=%s", [l for l, _ in sorted_x])
-        sorted_x = []   # rejects page ref numbers / detail callouts
+        trimmed = _extract_monotone_subsequence(sorted_x)
+        if len(trimmed) >= 2 and _is_valid_grid_axis(trimmed):
+            _log.debug("grid_extractor: x-axis salvaged via subsequence (%d→%d labels)", len(sorted_x), len(trimmed))
+            sorted_x = trimmed
+        else:
+            _log.debug("grid_extractor: x-axis rejected — labels=%s", [l for l, _ in sorted_x])
+            sorted_x = []
     if not _is_valid_grid_axis(sorted_y):
-        _log.debug("grid_extractor: y-axis rejected — labels=%s", [l for l, _ in sorted_y])
-        sorted_y = []
+        trimmed = _extract_monotone_subsequence(sorted_y)
+        if len(trimmed) >= 2 and _is_valid_grid_axis(trimmed):
+            _log.debug("grid_extractor: y-axis salvaged via subsequence (%d→%d labels)", len(sorted_y), len(trimmed))
+            sorted_y = trimmed
+        else:
+            _log.debug("grid_extractor: y-axis rejected — labels=%s", [l for l, _ in sorted_y])
+            sorted_y = []
 
     # Build zero-based real mm coordinates
     def _to_real(items: list[tuple[str, float]], base_pos: float) -> list[dict]:

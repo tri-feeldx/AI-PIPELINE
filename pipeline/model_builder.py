@@ -551,8 +551,9 @@ def _vision_fallback(
             )
             improved["_vision_schedule"] = True
 
-    # Fix foundation positions (missing, bad coords, or bad coverage)
-    if any(c in failed for c in ("foundations", "coords", "coverage")):
+    # Fix foundation positions — also re-extract when grid failed because off-grid
+    # vector positions are unreliable (raw page coords, not real-world mm).
+    if any(c in failed for c in ("grid", "foundations", "coords", "coverage")):
         log.info("Vision fallback: extracting foundation positions from image")
         vision_fdns = extract_foundations_vision(
             page, grid, improved.get("schedule", {})

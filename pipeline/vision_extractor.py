@@ -431,13 +431,13 @@ confidence: "high" = clearly on grid, "medium" = estimated, "low" = uncertain"""
                     continue
                 seen_grid_refs.add(gref)
             else:
-                # Off-grid dedup: proximity + label match.
-                # Tile overlap is ~10% of page → same foundation appears in 2 tiles
-                # at positions differing by < 2% of page width/height.
+                # Off-grid dedup: position proximity only (no label match).
+                # True tile-overlap duplicates remap to virtually identical page
+                # positions (Gemini accuracy ≈ 0.3% of page). Threshold 0.5%
+                # catches duplicates without removing real foundations at 1-2m spacing.
                 if any(
-                    abs(xp - e["x_percent"]) < 0.02
-                    and abs(yp - e["y_percent"]) < 0.02
-                    and str(e.get("label", "")).upper() == label
+                    abs(xp - e["x_percent"]) < 0.005
+                    and abs(yp - e["y_percent"]) < 0.005
                     for e in all_raw
                     if e.get("grid_ref", "off_grid") == "off_grid"
                 ):

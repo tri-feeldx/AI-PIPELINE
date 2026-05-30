@@ -75,7 +75,8 @@ def _type_from_dwg_number(num_str: str) -> str | None:
 # ── Keyword-based classification ─────────────────────────────────────────────
 
 _KW: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\bFOOTING\s+PLAN\b|\bFOUNDATION\s+PLAN\b|\bPILE\s+LAYOUT\b", re.I), "foundation_plan"),
+    (re.compile(r"\bFOOTING\s+PLAN\b|\bFOUNDATION\s+PLAN\b|\bPILE\s+LAYOUT\b"
+                r"|\bFOUNDATION\b.*\bARRANGEMENT\b|\bFOUNDATION\b.*\bOVERALL\b", re.I), "foundation_plan"),
     (re.compile(r"\bROOF\s+(STEEL|FRAMING|MARKING|PLAN)\b", re.I),                      "roof_plan"),
     (re.compile(r"\bLEVEL\s*\d+\s+(?:OUTLINE|FLOOR|MARKING|FRAMING|SLAB)\b", re.I),    "floor_plan"),
     (re.compile(r"\bSTEELWORK\s+MARKING\s+PLAN\b|\bSTEEL.*MARKING\s+PLAN\b", re.I),    "floor_plan"),

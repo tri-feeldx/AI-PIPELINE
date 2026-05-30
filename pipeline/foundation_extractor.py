@@ -30,7 +30,7 @@ _PILE_MARK_RE    = re.compile(r'^P(\d+[A-Za-z]?)$',  re.IGNORECASE)   # P1, P2a
 # Negative lookahead: not before kN, MPa, mm, kg (force/unit context)
 _FOOTING_TYPE_RE = re.compile(
     r'(?<![=×xX\d])'
-    r'\b(?:PF|PC|MC|M[DĐ]|MB|SF|RF|CB|F|P|M)(\d+[A-Za-z]?)\b'
+    r'\b(?:PF|PC|MC|M[DĐ]|MB|SF|RF|CB|PG|LG|F|P|M)(\d+[A-Za-z]?)\b'
     r'(?!\s*(?:kN|MPa|mm|kg|m\b))',
     re.IGNORECASE,
 )
@@ -300,6 +300,35 @@ def _is_plain_number(s: str) -> bool:
 
 # ── Annotation detection ───────────────────────────────────────────────────────
 
+def _build_mark_matcher(known_marks: set[str] | None) -> re.Pattern:
+    """Build a compiled regex for matching foundation type labels.
+
+    When the schedule provides ≥2 known marks, combines them as exact
+    alternatives (handles any firm-specific convention like TP1, BP2, SP3)
+    with the static prefix whitelist as fallback for marks not in the schedule.
+    Falls back to the static _FOOTING_TYPE_RE when < 2 known marks.
+    """
+    if not known_marks or len(known_marks) < 2:
+        return _FOOTING_TYPE_RE
+
+    # Sort longest first so longer marks (PF12) match before shorter ones (PF1)
+    known_alt = '|'.join(re.escape(m) for m in sorted(known_marks, key=len, reverse=True))
+    combined = (
+        r'(?<![=×xX\d])\b(?:'
+        + known_alt
+        # Static prefix fallback: catches marks that appear on the drawing
+        # but not in the schedule (unusual but possible)
+        + r'|PF\d+[A-Za-z]?|PC\d+[A-Za-z]?|MC\d+[A-Za-z]?|M[DĐ]\d+[A-Za-z]?'
+        + r'|MB\d+[A-Za-z]?|SF\d+[A-Za-z]?|RF\d+[A-Za-z]?|CB\d+[A-Za-z]?'
+        + r'|PG\d+[A-Za-z]?|LG\d+[A-Za-z]?|F\d+[A-Za-z]?|P\d+[A-Za-z]?|M\d+[A-Za-z]?'
+        + r')\b(?!\s*(?:kN|MPa|mm|kg|m\b))'
+    )
+    try:
+        return re.compile(combined, re.IGNORECASE)
+    except re.error:
+        return _FOOTING_TYPE_RE
+
+
 def _compute_snap_radius(x_axes: list, y_axes: list) -> float:
     """Compute snap-to-grid radius from actual grid spacing.
 
@@ -320,8 +349,13 @@ def find_all_pile_annotations(
     page: fitz.Page,
     grid: dict,
     snap_radius_mm: float | None = None,
+    known_marks: set[str] | None = None,
 ) -> tuple[dict[str, str], list[dict]]:
     """Find ALL pile / footing annotations on the drawing (including off-grid).
+
+    known_marks: set of mark labels from the schedule (e.g. {'PC1','PF1','PF2'}).
+        When provided and has ≥2 entries, builds a dynamic regex from those exact
+        labels so any firm-specific convention (TP1, BP2, etc.) is matched correctly.
 
     Returns:
         on_grid  : {grid_ref → label}   snapped to nearest intersection
@@ -334,6 +368,9 @@ def find_all_pile_annotations(
     # Compute snap radius adaptively from grid spacing (works for any scale)
     if snap_radius_mm is None:
         snap_radius_mm = _compute_snap_radius(x_axes, y_axes)
+
+    # Build schedule-aware matcher: exact known marks + static prefix fallback
+    matcher = _build_mark_matcher(known_marks)
 
     spans = _all_text(page)
     page_w = page.rect.width
@@ -356,7 +393,7 @@ def find_all_pile_annotations(
     seen_positions: set[tuple] = set()
 
     for t, x, y, sz in spans:
-        m = _FOOTING_TYPE_RE.match(t.strip())
+        m = matcher.match(t.strip())
         if not m:
             continue
         label = t.strip().upper().replace(" ", "")
@@ -647,7 +684,7 @@ def extract_foundations(page: fitz.Page, grid: dict, global_schedule: dict | Non
             schedule[mark] = spec
 
     pile_spec     = find_pile_spec_global(page)
-    on_grid, off_grid_anns = find_all_pile_annotations(page, grid)
+    on_grid, off_grid_anns = find_all_pile_annotations(page, grid, known_marks=set(schedule.keys()) or None)
     ground_beams  = detect_ground_beams(page, grid)
     rafts         = detect_raft_foundations(page, grid, schedule)
 

@@ -24,38 +24,22 @@ PT_TO_MM = 25.4 / 72.0  # 1 PDF point in millimetres
 
 
 def _is_valid_grid_axis(sorted_by_pos: list[tuple[str, float]]) -> bool:
-    """Universal structural grid validity — two physical principles:
+    """Structural grid validity check — spacing uniformity only.
 
-    A) Monotonic order: column/row labels in position order must also be in
-       value order (column 3 is always right of column 2).
-    B) Spacing uniformity: structural bays are approximately equal
-       (coefficient of variation of gaps must be < 0.60).
+    Australian (and Vietnamese) structural drawings routinely use non-sequential
+    grid label numbering (e.g. labels '10','09','04','08'... in page order).
+    These are grid line NAMES, not sequential indices — value-monotonicity is
+    NOT a valid constraint.
 
-    Rejects page reference numbers, detail callout numbers, and other
-    non-grid text that passes font-size and border-proximity filters.
+    The only reliable discriminator is spacing uniformity: structural bays are
+    approximately equal width, while random callout/reference numbers cluster
+    irregularly. CV (coefficient of variation of gap widths) < 0.80 passes.
     """
     if len(sorted_by_pos) < 2:
         return False
 
-    labels    = [lbl for lbl, _ in sorted_by_pos]
     positions = [pos for _, pos in sorted_by_pos]
 
-    # Principle A: value order matches position order
-    if all(lbl.isdigit() for lbl in labels):
-        vals = [int(lbl) for lbl in labels]
-        n    = len(vals)
-        inversions = sum(
-            1 for i in range(n) for j in range(i + 1, n) if vals[i] > vals[j]
-        )
-        total_pairs = n * (n - 1) / 2
-        if inversions / total_pairs > 0.30:
-            return False   # >30% inversions → reference numbers, not grid
-    elif all(lbl.isalpha() and len(lbl) == 1 for lbl in labels):
-        for i in range(len(labels) - 1):
-            if ord(labels[i + 1]) - ord(labels[i]) > 6:
-                return False   # alphabet gap > 6 → not a sequential grid (was 3)
-
-    # Principle B: spacing uniformity (CV < 0.60)
     if len(positions) >= 3:
         gaps     = [positions[i + 1] - positions[i] for i in range(len(positions) - 1)]
         mean_gap = sum(gaps) / len(gaps)
@@ -63,7 +47,7 @@ def _is_valid_grid_axis(sorted_by_pos: list[tuple[str, float]]) -> bool:
             variance = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
             cv = (variance ** 0.5) / mean_gap
             if cv > 0.80:
-                return False   # irregular spacing → not a grid axis (was 0.60; VN structures have varied bays)
+                return False   # irregular spacing → not a structural grid axis
 
     return True
 

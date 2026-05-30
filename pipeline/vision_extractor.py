@@ -402,6 +402,7 @@ ALSO IGNORE (do not count anything from these areas):
   - Section callout bubbles (circles with numbers like ①②③)
   - Dimension lines and leader arrows
   - North arrow and scale bar
+  - BH-## markers (e.g. BH-01, BH-03) — borehole test locations, geological data only
 
 ━━━ TASK ━━━
 Find every foundation annotation PLACED ON THE PLAN DRAWING (not in tables).
@@ -515,16 +516,16 @@ def _convert_vision_fdns_to_model(
     x_base = x_axes[0]["pdf_pos"] if x_axes else 0.0
     y_base = y_axes[0]["pdf_pos"] if y_axes else 0.0
 
-    # Column connection marks follow the pattern [BLD]-CC[N] (e.g. A-CC01, D-CC03).
-    # They appear next to pile caps in foundation plan drawings but are column marks,
-    # NOT foundation elements — exclude them from the foundation list.
-    _COL_MARK_RE = re.compile(r'^[A-Z]+-CC\d+$', re.I)
+    # Marks to exclude — not foundation elements:
+    #   [BLD]-CC[N]  column connection marks (e.g. A-CC01, D-CC03)
+    #   BH-[N]       borehole markers (geological test points, not foundations)
+    _IGNORE_MARK_RE = re.compile(r'^([A-Z]+-CC\d+|BH-\d+)$', re.I)
 
     result = []
     for i, vf in enumerate(vision_fdns):
         label = str(vf.get("label", "?")).upper()
-        if _COL_MARK_RE.match(label):
-            continue   # column connection mark, not a foundation
+        if _IGNORE_MARK_RE.match(label):
+            continue   # column connection mark or borehole — not a foundation
         grid_ref = vf.get("grid_ref", "off_grid")
         xp = float(vf.get("x_percent", 0.5))
         yp = float(vf.get("y_percent", 0.5))

@@ -223,11 +223,10 @@ def extract_grid(page: fitz.Page, scale: int = 100) -> dict:
                     # (already filtered above) but single/2-digit table cells
                     # also appear — kept separate so top-border takes priority.
                     x_bot_candidates.append((clean, x))
-            elif near_side and not near_top_bot and len(clean) <= 2:
-                # Numbers strictly at left/right side (1-2 digit = grid line number,
-                # NOT 3-digit dimension values like 750mm, 500mm, 400mm).
-                # Common in AU combined drawings using sequential numbers for both axes.
-                y_candidates.append((clean, y, x))
+                elif near_side and not near_top_bot:
+                    # Numbers strictly at left/right side (1-2 digit = grid line number).
+                    # Common in AU combined drawings using sequential numbers for both axes.
+                    y_candidates.append((clean, y, x))
         elif clean.isalpha():
             if near_side:
                 # Letters at left/right (including corners) → Y-axis
@@ -398,7 +397,7 @@ def extract_grids_from_pdf(
     # try extracting the grid from each plan page individually.
     # Common cause: 4-building PDFs where each building has unique grid labels
     # that only appear on 1 page and get filtered by min_count=2.
-    if not all_x and not all_y and plan_page_indices:
+    if not all_x and plan_page_indices:
         for i in plan_page_indices:
             if i >= doc.page_count:
                 continue

@@ -91,8 +91,36 @@ _KW: list[tuple[re.Pattern, str]] = [
 ]
 
 
+def _is_image_page(page: fitz.Page) -> bool:
+    """Return True when the page is essentially rasterized (screenshot/scan saved as PDF).
+
+    Detected by: fewer than 5 extractable text spans AND at least one embedded
+    image block. These pages have no vector text so classification and grid
+    extraction must be done entirely by Vision AI.
+    """
+    spans = _extract_spans(page)
+    if len(spans) >= 5:
+        return False
+    blocks = page.get_text("dict")["blocks"]
+    return any(b.get("type") == 1 for b in blocks)
+
+
 def classify_page(page: fitz.Page, page_num: int) -> dict:
     """Classify a page using drawing number suffix, then keywords."""
+    # Image-only pages (rasterized PDFs, screenshots) have no vector text.
+    # Treat them as foundation_plan so Vision AI handles full extraction.
+    if _is_image_page(page):
+        return {
+            "page_num":      page_num,
+            "drawing_type":  "foundation_plan",
+            "drawing_title": "IMAGE PAGE (Vision AI required)",
+            "level_name":    None,
+            "scale_ratio":   None,
+            "has_grid_lines": False,
+            "image_only":    True,
+            "confidence":    0.5,
+        }
+
     spans = _extract_spans(page)
     w, h = page.rect.width, page.rect.height
 

@@ -169,20 +169,25 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             elements = detect_elements(page, page_type, page_grid)
 
             # Run dedicated foundation extractor on foundation plan pages.
-            # Keep the result with the MOST footings (Footing Plan at 1:100
-            # beats Footing Details at 1:20 which appears first in page order).
+            # Vision AI always runs — it is the authoritative extractor.
+            # Vector extraction contributes schedule data and grid coordinates.
             if page_type == "foundation_plan":
                 active_grid = page_grid if page_grid["x_axes"] else grid
-                fdn_result = extract_foundations(page, active_grid, global_schedule)
 
-                # Quality gate — try Vision AI if vector result is poor
-                if fdn_result.get("has_foundation_plan"):
-                    quality = assess_quality(fdn_result, active_grid, classifications)
-                    if quality.needs_vision:
-                        fdn_result = _vision_fallback(
-                            page, active_grid, fdn_result, quality
-                        )
-                    # Collect every foundation page (multi-building support)
+                if cls.get("image_only"):
+                    # Rasterized page: no vector text to parse — go straight to Vision AI
+                    fdn_result = {"has_foundation_plan": True, "footings": [], "schedule": {}}
+                else:
+                    fdn_result = extract_foundations(page, active_grid, global_schedule)
+
+                # Vision AI always runs for foundations regardless of vector result.
+                # Vector positions are unreliable when grid detection fails (common for
+                # multi-building combined PDFs where each building has unique grid labels).
+                quality = assess_quality(fdn_result, active_grid, classifications)
+                fdn_result = _vision_fallback(page, active_grid, fdn_result, quality)
+
+                # Collect every foundation page (multi-building support)
+                if fdn_result.get("has_foundation_plan") or fdn_result.get("footings"):
                     all_fdn_results.append(fdn_result)
         else:
             elements = {"columns": [], "beams": [], "slabs": []}
@@ -255,6 +260,21 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
         foundations  = _generate_piles_from_grid(grid)
         ground_beams = []
         rafts        = []
+
+    # Schedule-count validation: warn when extracted count differs significantly
+    # from the count implied by the pile/footing schedule.
+    import logging as _log_mod
+    _logger = _log_mod.getLogger(__name__)
+    _sched = foundation_extraction.get("schedule", {})
+    _expected = sum(
+        v.get("pile_count", 1) for v in _sched.values()
+        if v.get("ftype") in ("pile_cap", "bored_pier", "pad_footing")
+    )
+    if _expected > 2 and abs(len(foundations) - _expected) / _expected > 0.25:
+        _logger.warning(
+            "Foundation count mismatch: extracted %d, schedule implies %d — review needed",
+            len(foundations), _expected,
+        )
 
     # ── Stage 4c: Assign section sizes and level spans ───────────────────────
     bottom_lv = levels[0]  if levels else {"name": "GROUND FLOOR", "elevation_mm": 0}

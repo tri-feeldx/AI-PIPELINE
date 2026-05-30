@@ -409,50 +409,33 @@ For EACH placed foundation:
   1. Read its exact mark label (e.g. P1, PC2, F1, PG3)
   2. Identify which grid intersection it sits ON.
      grid_ref format = "Y_label/X_label" e.g. "A/1", "B/3"
-  3. ONLY if not on a grid intersection: record x_percent, y_percent (0.0–1.0 from top-left)
+  3. ONLY if not on a grid intersection: also record x_percent and y_percent (0.0–1.0 from top-left)
 
 ACCURACY RULES:
-- Foundation on grid intersection A×1 → grid_ref="A/1", is_on_grid=true
-- Foundation off-grid → grid_ref="off_grid", is_on_grid=false, give x_percent/y_percent
-- Do NOT guess grid_ref — if unsure, set is_on_grid=false
-- Each physical occurrence of a mark = one entry (P1 at 4 corners = 4 entries)
+- Foundation on grid intersection → grid_ref="Y/X" (e.g. "A/1")
+- Foundation off-grid → grid_ref="off_grid" AND include x_percent, y_percent
+- Do NOT guess grid_ref — if unsure use "off_grid" with x/y
+- Each physical occurrence of a mark = one entry (P1 at 4 corners = 4 separate entries)
 
-Return ONLY valid JSON array, no explanation:
+OUTPUT FORMAT — COMPACT JSON, one object per line, no extra whitespace:
+On-grid example:  {{"label":"P1","grid_ref":"A/1"}}
+Off-grid example: {{"label":"P3","grid_ref":"off_grid","x_percent":0.05,"y_percent":0.50}}
+
+Return ONLY the JSON array, no explanation:
 [
-  {{
-    "label": "P1",
-    "grid_ref": "A/1",
-    "x_percent": 0.15,
-    "y_percent": 0.22,
-    "is_on_grid": true,
-    "confidence": "high"
-  }},
-  {{
-    "label": "P1",
-    "grid_ref": "A/2",
-    "x_percent": 0.28,
-    "y_percent": 0.22,
-    "is_on_grid": true,
-    "confidence": "high"
-  }},
-  {{
-    "label": "P3",
-    "grid_ref": "off_grid",
-    "x_percent": 0.05,
-    "y_percent": 0.50,
-    "is_on_grid": false,
-    "confidence": "medium"
-  }}
-]
+{{"label":"P1","grid_ref":"A/1"}},
+{{"label":"P1","grid_ref":"A/2"}},
+{{"label":"P3","grid_ref":"off_grid","x_percent":0.05,"y_percent":0.50}}
+]"""
 
-confidence: "high" = clearly on grid, "medium" = estimated, "low" = uncertain"""
-
-    # Use 2×2 tiled images for better resolution on large A0/A1 drawings.
-    # Each tile is sent at higher DPI; results are merged and deduplicated.
+    # Use 3×3 tiled images — 9 tiles reduces foundations per tile to ~15-20.
+    # Each tile at 200 DPI; results are merged and deduplicated across tile borders.
+    # 2×2 caused Gemini output truncation at ~2600 chars (~17 objects) when a tile
+    # contained 50+ foundations. 3×3 keeps each tile's response well under that limit.
     all_raw: list[dict] = []
     seen_grid_refs: set[str] = set()
 
-    for tile_png, tx0, ty0, tw, th in _page_to_tiles(page):
+    for tile_png, tx0, ty0, tw, th in _page_to_tiles(page, cols=3, rows=3):
         raw = _call_gemini_with_retry(tile_png, prompt)
         if raw is None:
             logger.warning("extract_foundations_vision: tile (%.2f,%.2f) got no response", tx0, ty0)
@@ -551,8 +534,8 @@ def _convert_vision_fdns_to_model(
         x_mm = round((x_pdf - x_base) * pt_to_mm, 1)
         y_mm = round((y_pdf - y_base) * pt_to_mm, 1)
 
-        # Snap to grid intersection if on_grid
-        if vf.get("is_on_grid") and "/" in grid_ref:
+        # Snap to grid intersection when grid_ref is a valid "Y/X" reference
+        if grid_ref != "off_grid" and "/" in grid_ref:
             parts = grid_ref.split("/")
             y_lbl, x_lbl = (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else ("", "")
             for xa in x_axes:

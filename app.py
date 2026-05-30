@@ -68,7 +68,78 @@ if not uploaded:
 st.divider()
 run_btn = st.button("▶  Run Vector Pipeline", type="primary")
 
+
+def _render_results(job: dict) -> None:
+    """Render download buttons, metrics, expanders from a completed job dict."""
+    st.divider()
+    st.success("✅  Pipeline complete!")
+
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        st.download_button(
+            "⬇️  Download sketchup_model.rb",
+            data=job["rb_bytes"],
+            file_name="sketchup_model.rb",
+            mime="text/plain",
+            type="primary",
+        )
+    with col_dl2:
+        if job.get("log_bytes"):
+            st.download_button(
+                "⬇️  Download pipeline.log",
+                data=job["log_bytes"],
+                file_name=f"pipeline_{job['job_id']}.log",
+                mime="text/plain",
+            )
+
+    report  = job["report"]
+    unified = job["unified"]
+    job_id  = job["job_id"]
+    eg = report["elements_generated"]
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Foundations", eg.get("foundations", 0))
+    c2.metric("Rafts",       eg.get("rafts", 0))
+    c3.metric("Gnd Beams",   eg.get("ground_beams", 0))
+    c4.metric("Columns",     eg.get("columns", 0))
+    c5.metric("Beams",       eg.get("beams", 0))
+    c6.metric("Slabs",       eg.get("slabs", 0))
+
+    fdn_schedule = unified.get("foundation_schedule", {})
+    if fdn_schedule:
+        with st.expander("🔩  Foundation schedule extracted from PDF"):
+            rows = []
+            for lbl, spec in sorted(fdn_schedule.items()):
+                rows.append({
+                    "Type": lbl,
+                    "Category": spec.get("ftype", "?"),
+                    "Dia (mm)": int(spec.get("pile_dia_mm", 0)) or "—",
+                    "Socket (m)": round(spec.get("pile_len_mm", 0) / 1000, 1) or "—",
+                    "Cap W×D (mm)": (
+                        f"{int(spec.get('width_mm',0))}×{int(spec.get('depth_mm',0))}"
+                        if spec.get("width_mm") else "—"
+                    ),
+                    "Cap H (mm)": int(spec.get("height_mm", 0)) or "—",
+                })
+            st.dataframe(rows, use_container_width=True)
+
+    st.caption(
+        f"Job: `data/jobs/{job_id}/`  |  "
+        f"Grid: {len(unified['grid_system']['x_axes'])}×{len(unified['grid_system']['y_axes'])}  |  "
+        f"Scale: 1:{unified['grid_system']['scale']}  |  "
+        f"Ruby lines: {report['ruby_line_count']}  |  "
+        f"Warnings: {len(report['warnings'])}"
+    )
+    if report["warnings"]:
+        with st.expander(f"⚠️  {len(report['warnings'])} warnings"):
+            for w in report["warnings"]:
+                st.warning(w)
+
+
+# If a previous job exists (e.g. user clicked a download button → rerun), show its
+# results without re-running the pipeline. The run button starts a new job fresh.
 if not run_btn:
+    if "last_job" in st.session_state:
+        _render_results(st.session_state["last_job"])
     st.stop()
 
 # ── Import pipeline modules here (NOT at top level) ───────────────────────────
@@ -208,70 +279,16 @@ with col_right:
     with st.expander("📄  stage5_generation_report.json"):
         st.json(report)
 
-# ── Download ──────────────────────────────────────────────────────────────────
-st.divider()
-st.success("✅  Pipeline complete!")
-
-# Close and remove the per-job log handler
+# ── Save results + render ─────────────────────────────────────────────────────
+# Close log handler before reading the file bytes
 _root_logger.removeHandler(_file_handler)
 _file_handler.close()
 
-rb_bytes = (job_dir / "sketchup_model.rb").read_bytes()
-col_dl1, col_dl2 = st.columns(2)
-with col_dl1:
-    st.download_button(
-        "⬇️  Download sketchup_model.rb",
-        data=rb_bytes,
-        file_name="sketchup_model.rb",
-        mime="text/plain",
-        type="primary",
-    )
-with col_dl2:
-    if _log_path.exists():
-        st.download_button(
-            "⬇️  Download pipeline.log",
-            data=_log_path.read_bytes(),
-            file_name=f"pipeline_{job_id}.log",
-            mime="text/plain",
-        )
-
-eg = report["elements_generated"]
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Foundations", eg.get("foundations", 0))
-c2.metric("Rafts",       eg.get("rafts", 0))
-c3.metric("Gnd Beams",   eg.get("ground_beams", 0))
-c4.metric("Columns",     eg.get("columns", 0))
-c5.metric("Beams",       eg.get("beams", 0))
-c6.metric("Slabs",       eg.get("slabs", 0))
-
-# Foundation type breakdown
-fdn_schedule = unified.get("foundation_schedule", {})
-if fdn_schedule:
-    with st.expander("🔩  Foundation schedule extracted from PDF"):
-        rows = []
-        for lbl, spec in sorted(fdn_schedule.items()):
-            rows.append({
-                "Type": lbl,
-                "Category": spec.get("ftype", "?"),
-                "Dia (mm)": int(spec.get("pile_dia_mm", 0)) or "—",
-                "Socket (m)": round(spec.get("pile_len_mm", 0) / 1000, 1) or "—",
-                "Cap W×D (mm)": (
-                    f"{int(spec.get('width_mm',0))}×{int(spec.get('depth_mm',0))}"
-                    if spec.get("width_mm") else "—"
-                ),
-                "Cap H (mm)": int(spec.get("height_mm", 0)) or "—",
-            })
-        st.dataframe(rows, use_container_width=True)
-
-st.caption(
-    f"Job: `data/jobs/{job_id}/`  |  "
-    f"Grid: {len(unified['grid_system']['x_axes'])}×{len(unified['grid_system']['y_axes'])}  |  "
-    f"Scale: 1:{unified['grid_system']['scale']}  |  "
-    f"Ruby lines: {report['ruby_line_count']}  |  "
-    f"Warnings: {len(report['warnings'])}"
-)
-
-if report["warnings"]:
-    with st.expander(f"⚠️  {len(report['warnings'])} warnings"):
-        for w in report["warnings"]:
-            st.warning(w)
+st.session_state["last_job"] = {
+    "rb_bytes":  (job_dir / "sketchup_model.rb").read_bytes(),
+    "log_bytes": _log_path.read_bytes() if _log_path.exists() else None,
+    "job_id":    job_id,
+    "unified":   unified,
+    "report":    report,
+}
+_render_results(st.session_state["last_job"])

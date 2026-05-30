@@ -137,6 +137,12 @@ def _parse_json(text: str) -> dict | list | None:
     # Strip ```json ... ``` fences
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
+    # Normalise Python/JS literals that json.loads rejects
+    text = re.sub(r'\bNone\b',     'null',  text)
+    text = re.sub(r'\bNaN\b',      '0',     text)
+    text = re.sub(r'\bInfinity\b', '0',     text)
+    text = re.sub(r'\bTrue\b',     'true',  text)
+    text = re.sub(r'\bFalse\b',    'false', text)
 
     try:
         return json.loads(text)
@@ -332,19 +338,30 @@ def extract_foundations_vision(
     Returns list of foundation dicts (same schema as foundation_extractor output).
     Returns None on failure.
     """
-    # If vector grid extraction failed (empty axes), build a synthetic grid from
-    # Vision AI so that grid-snapping in _convert_vision_fdns_to_model works.
-    if not grid.get("x_axes") and not grid.get("y_axes"):
-        logger.info("extract_foundations_vision: vector grid empty — calling extract_grid_vision first")
+    # Build a synthetic Y-axis from Vision AI whenever the vector extractor failed
+    # to find Y-axis grid labels (common for AU drawings where both axes use numbers).
+    # Without Y-axis snapping, all off-grid positions use raw y_percent * scale which
+    # is too imprecise at 1:250 scale (1% error = ~21 m real-world offset).
+    if not grid.get("y_axes"):
+        logger.info("extract_foundations_vision: Y-axis missing — calling extract_grid_vision for Y")
         vision_grid_data = extract_grid_vision(page)
         if vision_grid_data and (vision_grid_data.get("x_axes") or vision_grid_data.get("y_axes")):
-            grid = _build_synthetic_grid(vision_grid_data, page)
+            vision_synth = _build_synthetic_grid(vision_grid_data, page)
+            # Merge: keep existing vector X-axis if present, take Vision Y-axis
+            merged = dict(grid)
+            if not merged.get("x_axes") and vision_synth.get("x_axes"):
+                merged["x_axes"] = vision_synth["x_axes"]
+            if vision_synth.get("y_axes"):
+                merged["y_axes"] = vision_synth["y_axes"]
+            if not merged.get("pt_to_mm"):
+                merged["pt_to_mm"] = vision_synth.get("pt_to_mm", 35.28)
+            grid = merged
             logger.info(
-                "extract_foundations_vision: synthetic grid built — %d x-axes, %d y-axes",
-                len(grid["x_axes"]), len(grid["y_axes"]),
+                "extract_foundations_vision: grid after merge — %d x-axes, %d y-axes",
+                len(grid.get("x_axes", [])), len(grid.get("y_axes", [])),
             )
         else:
-            logger.warning("extract_foundations_vision: grid extraction (vision) also failed — positions will be approximate")
+            logger.warning("extract_foundations_vision: Vision AI grid also failed — Y positions will be approximate")
 
     x_labels = [a["label"] for a in grid.get("x_axes", [])]
     y_labels = [a["label"] for a in grid.get("y_axes", [])]

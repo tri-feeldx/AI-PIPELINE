@@ -131,8 +131,15 @@ def progress_cb(stage: str, pct: float):
         else:
             bar.progress(max(0.05, pct), text=f"{label}…  {int(pct*100)}%")
 
+_log_lines: list[str] = []
+_log_placeholder = st.empty()
+
+def log_cb(msg: str):
+    _log_lines.append(msg)
+    _log_placeholder.code("\n".join(_log_lines), language=None)
+
 try:
-    unified = build_model(str(pdf_path), str(job_dir), progress_cb=progress_cb)
+    unified = build_model(str(pdf_path), str(job_dir), progress_cb=progress_cb, log_cb=log_cb)
 except Exception as e:
     st.error(f"Pipeline failed: {e}")
     st.exception(e)

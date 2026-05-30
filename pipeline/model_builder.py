@@ -60,7 +60,33 @@ def _section_dims(label: str) -> dict:
     return _DEFAULT_BEAM_DIMS
 
 
-def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
+def _assign_foundation_roles(classifications: list[dict]) -> None:
+    """Tag each foundation_plan page as 'overall' or 'detail'.
+
+    When a PDF mixes an overview (e.g. 1:250) with enlarged detail sections
+    (1:100), Vision AI should only extract positions from the overview pages.
+    Detail pages are harvested for schedule data only.
+
+    Multi-building PDFs where all foundation pages share the same scale are
+    left as 'overall' so every building is still extracted.
+    """
+    fdn = [c for c in classifications if c["drawing_type"] == "foundation_plan"]
+    valid = [c["scale_ratio"] for c in fdn if c.get("scale_ratio")]
+    if not valid:
+        for c in fdn:
+            c["plan_role"] = "overall"
+        return
+    max_s, min_s = max(valid), min(valid)
+    if max_s >= min_s * 1.5:
+        for c in fdn:
+            s = c.get("scale_ratio") or 0
+            c["plan_role"] = "overall" if s >= max_s * 0.9 else "detail"
+    else:
+        for c in fdn:
+            c["plan_role"] = "overall"
+
+
+def build_model(pdf_path: str, job_dir: str, progress_cb=None, log_cb=None) -> dict:
     """Full vector-based pipeline — no AI calls.
 
     Stages:
@@ -75,8 +101,21 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
 
+    def _log(msg: str):
+        if log_cb:
+            log_cb(msg)
+
     # ── Stage 2a: Page classification ────────────────────────────────────────
     classifications = classify_all_pages(pdf_path)
+    _assign_foundation_roles(classifications)
+
+    # Emit classification summary
+    from collections import Counter as _Counter
+    _type_counts = _Counter(c["drawing_type"] for c in classifications)
+    _log(f"Classified {total_pages} pages: " + ", ".join(f"{v}× {k}" for k, v in sorted(_type_counts.items())))
+    _fdn_roles = [(c["page_num"], c.get("plan_role","?"), c.get("scale_ratio")) for c in classifications if c["drawing_type"] == "foundation_plan"]
+    for _pn, _role, _sc in _fdn_roles:
+        _log(f"  Page {_pn}: foundation_plan [{_role.upper()}] scale 1:{_sc or '?'}")
     _write_json(job_dir / "stage2_classification.json", {
         "stage": 2,
         "stage_name": "Page Classifier (vector)",
@@ -169,26 +208,42 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
             elements = detect_elements(page, page_type, page_grid)
 
             # Run dedicated foundation extractor on foundation plan pages.
-            # Vision AI always runs — it is the authoritative extractor.
-            # Vector extraction contributes schedule data and grid coordinates.
+            # Vision AI always runs on OVERALL pages — it is the authoritative extractor.
+            # DETAIL pages (enlarged sections of the same plan) are harvested for
+            # schedule data only to avoid counting the same foundations multiple times.
             if page_type == "foundation_plan":
                 active_grid = page_grid if page_grid["x_axes"] else grid
 
-                if cls.get("image_only"):
-                    # Rasterized page: no vector text to parse — go straight to Vision AI
-                    fdn_result = {"has_foundation_plan": True, "footings": [], "schedule": {}}
+                if cls.get("plan_role") == "detail":
+                    # Detail section: same physical area as the OVERALL page but zoomed in.
+                    # Extract schedule/pile spec only — positions come from the OVERALL page.
+                    extra_sched = parse_footing_schedule(page)
+                    for mark, spec in extra_sched.items():
+                        if mark not in global_schedule:
+                            global_schedule[mark] = spec
+                    _log(f"  Page {page_num}: DETAIL (1:{cls.get('scale_ratio','?')}) — schedule scan only, skipping Vision AI")
                 else:
-                    fdn_result = extract_foundations(page, active_grid, global_schedule)
+                    # OVERALL page: extract positions via vector + Vision AI
+                    _log(f"  Page {page_num}: OVERALL (1:{cls.get('scale_ratio','?')}) — running Vision AI")
 
-                # Vision AI always runs for foundations regardless of vector result.
-                # Vector positions are unreliable when grid detection fails (common for
-                # multi-building combined PDFs where each building has unique grid labels).
-                quality = assess_quality(fdn_result, active_grid, classifications)
-                fdn_result = _vision_fallback(page, active_grid, fdn_result, quality)
+                    if cls.get("image_only"):
+                        # Rasterized page: no vector text to parse — go straight to Vision AI
+                        fdn_result = {"has_foundation_plan": True, "footings": [], "schedule": {}}
+                    else:
+                        fdn_result = extract_foundations(page, active_grid, global_schedule)
 
-                # Collect every foundation page (multi-building support)
-                if fdn_result.get("has_foundation_plan") or fdn_result.get("footings"):
-                    all_fdn_results.append(fdn_result)
+                    # Vision AI always runs for OVERALL pages regardless of vector result.
+                    # Vector positions are unreliable when grid detection fails (common for
+                    # multi-building combined PDFs where each building has unique grid labels).
+                    quality = assess_quality(fdn_result, active_grid, classifications)
+                    fdn_result = _vision_fallback(page, active_grid, fdn_result, quality)
+
+                    n_found = len(fdn_result.get("footings", []))
+                    _log(f"    → found {n_found} foundations on page {page_num}")
+
+                    # Collect every OVERALL foundation page (multi-building support)
+                    if fdn_result.get("has_foundation_plan") or fdn_result.get("footings"):
+                        all_fdn_results.append(fdn_result)
         else:
             elements = {"columns": [], "beams": [], "slabs": []}
 
@@ -246,6 +301,7 @@ def build_model(pdf_path: str, job_dir: str, progress_cb=None) -> dict:
     # Falls back to grid-intersection generation only when no foundation
     # plan page was found at all.
     foundation_extraction = _merge_foundation_pages(all_fdn_results)
+    _log(f"Merge complete: {len(all_fdn_results)} OVERALL page(s) → {len(foundation_extraction.get('footings', []))} foundations total")
 
     ai_used = {
         "grid":        foundation_extraction.get("_vision_grid", False),
